@@ -14,7 +14,8 @@ import yaml
 
 from extractor import builder as B
 from extractor import autotemplate as AT
-from extractor.security import log_event
+from extractor.security import log_event, check_upload_detailed
+from extractor.errors import diagnose_exception
 
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
@@ -22,7 +23,7 @@ try:
 except Exception:
     HAVE_CLICK = False
 
-from extractor.ui import apply_theme, hero
+from extractor.ui import apply_theme, hero, render_error_card
 
 st.set_page_config(page_title="Add a vendor", page_icon="➕", layout="centered")
 apply_theme()
@@ -41,6 +42,20 @@ ss.setdefault("li_pending_x0", None)
 vendor_name = st.text_input("Vendor name", placeholder="e.g. Acme Corporation")
 sample = st.file_uploader("Upload ONE sample invoice from this vendor (PDF)", type=["pdf"])
 if sample is not None:
+    data = sample.getbuffer().tobytes()
+    diag = check_upload_detailed(data, sample.name)
+    if not diag["ok"]:
+        render_error_card(
+            title=diag["title"],
+            message=diag["message"],
+            suggestion=diag["suggestion"],
+            details=diag["details"],
+            filename=sample.name,
+            icon="🚫",
+        )
+        ss.sample_path = None
+        st.stop()
+
     prev_tmp = ss.get("sample_tmp_path")
     if prev_tmp and os.path.exists(prev_tmp):
         try:
@@ -48,7 +63,7 @@ if sample is not None:
         except OSError:
             pass
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(sample.getbuffer())
+        tmp.write(data)
         tmp_path = tmp.name
     ss.sample_tmp_path = tmp_path
     ss.sample_path = tmp_path
@@ -57,8 +72,26 @@ if not ss.sample_path:
     st.info("Upload a sample invoice to begin.")
     st.stop()
 
-page = B.load_page(ss.sample_path)
-words = page["words"]
+try:
+    page = B.load_page(ss.sample_path)
+    words = page["words"]
+except Exception as e:
+    diag = diagnose_exception(e, filename=sample.name if sample else "Sample Invoice")
+    render_error_card(
+        title=diag["title"],
+        message=diag["message"],
+        suggestion=diag["suggestion"],
+        details=diag["details"],
+        filename=diag["filename"],
+        icon="❌",
+    )
+    ss.sample_path = None
+    st.stop()
+
+if not words:
+    st.warning("⚠️ **No selectable text words were detected on this invoice.** "
+               "It appears to be a scanned image or photo. Building a template requires digital text. "
+               "You can use **Extract Any Invoice** in the sidebar to extract scanned documents with AI and OCR.")
 
 method = st.radio("How would you like to build the template?",
                   options=["auto", "ai", "point", "pick"],
@@ -92,11 +125,21 @@ if method == "auto":
     if st.button("Build template from this invoice", type="primary",
                  use_container_width=True):
         with st.spinner("Reading the invoice layout…"):
-            tpl, report, inv, rec = AT.build_and_verify(ss.sample_path, vendor_name or None)
-        ss.draft_yaml = B.to_yaml(tpl)
-        ss.auto_report = report
-        ss.auto_result = (inv, rec)
-        log_event("template_autobuilt", f"vendor={vendor_name or tpl.get('vendor')}")
+            try:
+                tpl, report, inv, rec = AT.build_and_verify(ss.sample_path, vendor_name or None)
+                ss.draft_yaml = B.to_yaml(tpl)
+                ss.auto_report = report
+                ss.auto_result = (inv, rec)
+                log_event("template_autobuilt", f"vendor={vendor_name or tpl.get('vendor')}")
+            except Exception as e:
+                diag = diagnose_exception(e, filename=sample.name if sample else "")
+                render_error_card(
+                    title=diag["title"],
+                    message=diag["message"],
+                    suggestion=diag["suggestion"],
+                    details=diag["details"],
+                    icon="❌"
+                )
 
     if ss.get("auto_report"):
         for line in ss.auto_report:

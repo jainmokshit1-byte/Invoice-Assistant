@@ -13,7 +13,12 @@ from .rules import (apply_rules, load_rules, save_rules, load_all as load_all_ru
 from .dedupe import check_duplicates, append_history, load_history, file_hash, clear_history
 from .exporters import to_json, to_quickbooks_csv, to_tally_xml
 from .ocr import extract_text_with_ocr_fallback, ocr_pdf, is_scanned
-from . import security, ui
+from .errors import (
+    ExtractionError, CorruptedPDFError, EncryptedPDFError, EmptyFileError,
+    NonPDFError, FileTooLargeError, NoExtractableTextError, TemplateMismatchError,
+    AIExtractionError, diagnose_pdf_bytes, diagnose_exception
+)
+from . import security, ui, errors
 
 __all__ = [
     "extract_invoice", "list_vendors", "load_template",
@@ -21,9 +26,12 @@ __all__ = [
     "extract_generic", "invoice_from_data", "reconcile",
     "detect_vendor", "guess_vendor_name", "pdf_text",
     "apply_rules", "load_rules", "save_rules", "load_all_rules", "save_all_rules",
-    "delete_vendor_rules", "RULE_PRESETS", "DEFAULT_RULES", "security", "ui",
+    "delete_vendor_rules", "RULE_PRESETS", "DEFAULT_RULES", "security", "ui", "errors",
     "check_duplicates", "append_history", "load_history", "file_hash", "clear_history",
     "to_json", "to_quickbooks_csv", "to_tally_xml",
     "extract_text_with_ocr_fallback", "ocr_pdf", "is_scanned",
+    "ExtractionError", "CorruptedPDFError", "EncryptedPDFError", "EmptyFileError",
+    "NonPDFError", "FileTooLargeError", "NoExtractableTextError", "TemplateMismatchError",
+    "AIExtractionError", "diagnose_pdf_bytes", "diagnose_exception",
 ]
 

@@ -97,3 +97,47 @@ def hero(title: str, subtitle: str = "", color: str = "#1B4F86"):
               <h1 style="margin:0;font-size:1.95rem;font-weight:800;color:#fff;">{safe_title}</h1>
               {sub}
             </div>""", unsafe_allow_html=True)
+
+
+def render_error_card(
+    title: str,
+    message: str,
+    suggestion: str = "",
+    details: str = "",
+    filename: str = "",
+    icon: str = "🚫",
+):
+    """
+    Render a clean, high-contrast, actionable error card.
+    Highlights:
+      - Clear description of what failed
+      - Practical recovery steps
+      - Collapsible technical diagnostics (if available)
+    """
+    fn_display = f" — `{filename}`" if filename else ""
+    header_html = f"### {icon} {title}{fn_display}"
+    st.markdown(header_html)
+
+    body = f"**Problem:** {message}\n\n"
+    if suggestion:
+        body += f"💡 **How to resolve:** {suggestion}\n\n"
+    st.warning(body)
+
+    if details and details.strip():
+        with st.expander(f"🔍 Technical details ({filename or 'Error log'})", expanded=False):
+            st.code(details.strip(), language="text")
+
+
+def render_failed_uploads_summary(failures: list[dict]):
+    """Render a batch of failed upload/extraction diagnostics."""
+    if not failures:
+        return
+    for item in failures:
+        render_error_card(
+            title=item.get("title", "Extraction Error"),
+            message=item.get("message", "Unknown error"),
+            suggestion=item.get("suggestion", ""),
+            details=item.get("details", ""),
+            filename=item.get("filename", item.get("file", "")),
+            icon=item.get("icon", "🚫"),
+        )

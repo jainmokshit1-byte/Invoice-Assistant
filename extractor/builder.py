@@ -40,16 +40,30 @@ def default_type(name: str) -> str:
 def load_page(pdf_path: str, resolution: int = 120):
     """Return words (with coordinates), page size in points, a PIL image of the
     page, and the pixels-per-point scale used to render it."""
-    with pdfplumber.open(pdf_path) as pdf:
-        page = pdf.pages[0]
-        from .engine import clean_text
-        words = []
-        for w in page.extract_words():
-            w = dict(w)
-            w["text"] = clean_text(w["text"])
-            words.append(w)
-        width, height = page.width, page.height
-        image = page.to_image(resolution=resolution).original  # PIL image
+    from .errors import CorruptedPDFError, EncryptedPDFError, EmptyFileError
+    fn = os.path.basename(pdf_path)
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                raise EmptyFileError(f"'{fn}' contains 0 pages.", filename=fn)
+            page = pdf.pages[0]
+            from .engine import clean_text
+            words = []
+            for w in page.extract_words():
+                w = dict(w)
+                w["text"] = clean_text(w["text"])
+                words.append(w)
+            width, height = page.width, page.height
+            image = page.to_image(resolution=resolution).original  # PIL image
+    except (EmptyFileError, CorruptedPDFError, EncryptedPDFError):
+        raise
+    except Exception as e:
+        low = str(e).lower()
+        if "password" in low or "encrypt" in low:
+            raise EncryptedPDFError(f"'{fn}' is password-protected or encrypted: {e}", filename=fn) from e
+        raise CorruptedPDFError(f"Failed to open sample invoice '{fn}': {e}", filename=fn) from e
+
     scale = resolution / 72.0
     return {"words": words, "width": width, "height": height,
             "image": image, "scale": scale}
