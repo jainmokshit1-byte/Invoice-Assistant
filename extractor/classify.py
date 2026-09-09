@@ -12,23 +12,26 @@ from .templates import list_vendors, load_template
 
 
 def pdf_text(pdf_path: str, first_page_only: bool = True) -> str:
-    from .ocr import extract_text_with_ocr_fallback
-    text, _, _ = extract_text_with_ocr_fallback(pdf_path)
-    # FIX 8: strip OCR page markers before vendor scoring — markers make the
-    # truthiness check pass even when no real content was extracted, and they
-    # pollute keyword matching with structural noise
-    if text:
-        text = re.sub(r'---\s*PAGE\s*\d+\s*---', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'===.*?===', '', text, flags=re.IGNORECASE)
-        text = text.strip()
-    if text and text.strip():
-        if first_page_only:
-            p2 = text.find("--- PAGE 2 ---")
-            return text[:p2] if p2 != -1 else text
-        return text
-    with pdfplumber.open(pdf_path) as pdf:
-        pages = pdf.pages[:1] if first_page_only else pdf.pages
-        return "\n".join((p.extract_text() or "") for p in pages)
+    try:
+        from .ocr import extract_text_with_ocr_fallback
+        text, _, _ = extract_text_with_ocr_fallback(pdf_path)
+        # FIX 8: strip OCR page markers before vendor scoring — markers make the
+        # truthiness check pass even when no real content was extracted, and they
+        # pollute keyword matching with structural noise
+        if text:
+            text = re.sub(r'---\s*PAGE\s*\d+\s*---', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'===.*?===', '', text, flags=re.IGNORECASE)
+            text = text.strip()
+        if text and text.strip():
+            if first_page_only:
+                p2 = text.find("--- PAGE 2 ---")
+                return text[:p2] if p2 != -1 else text
+            return text
+        with pdfplumber.open(pdf_path) as pdf:
+            pages = pdf.pages[:1] if first_page_only else pdf.pages
+            return "\n".join((p.extract_text() or "") for p in pages)
+    except Exception:
+        return ""
 
 
 

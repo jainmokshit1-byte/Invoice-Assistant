@@ -26,3 +26,7 @@ output/processing_history.csv
 # OS files
 .DS_Store
 Thumbs.db
+
+# Test sample directories
+sample_invoices/
+test_bad_samples/

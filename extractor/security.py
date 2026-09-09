@@ -169,14 +169,25 @@ def safe_filename(name: str) -> str:
     return re.sub(r'[<>:"|?*\x00-\x1f]', "_", name)[:180] or "file.pdf"
 
 
-def check_upload(data: bytes, filename: str, settings: dict = None):
-    """Validate an uploaded file. Returns (ok, message)."""
+def check_upload_detailed(data: bytes, filename: str, settings: dict = None) -> dict:
+    """Validate an uploaded file with comprehensive diagnostics and recovery steps."""
     s = settings or load_settings()
-    max_bytes = int(s.get("max_file_mb", 25)) * 1024 * 1024
-    if len(data) > max_bytes:
-        return False, f"{filename} is larger than the {s['max_file_mb']} MB limit."
-    if not data[:5].startswith(b"%PDF"):
-        return False, f"{filename} is not a valid PDF (missing PDF signature)."
+    max_mb = int(s.get("max_file_mb", 25))
+    from .errors import diagnose_pdf_bytes
+    return diagnose_pdf_bytes(data, safe_filename(filename), max_mb=max_mb)
+
+
+def check_upload(data: bytes, filename: str, settings: dict = None):
+    """Validate an uploaded file. Returns (ok, message).
+
+    Message contains a clear explanation of what went wrong and actionable recovery advice.
+    """
+    diag = check_upload_detailed(data, filename, settings)
+    if not diag["ok"]:
+        msg = diag["message"]
+        if diag.get("suggestion"):
+            msg = f"{msg} — {diag['suggestion']}"
+        return False, msg
     return True, ""
 
 

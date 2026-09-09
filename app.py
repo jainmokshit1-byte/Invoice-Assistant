@@ -8,8 +8,9 @@ import tempfile
 
 import streamlit as st
 
-from extractor.ui import apply_theme, hero
-from extractor.security import (check_upload, safe_filename, log_event, load_settings)
+from extractor.ui import apply_theme, hero, render_error_card
+from extractor.security import (check_upload, check_upload_detailed, safe_filename, log_event, load_settings)
+from extractor.errors import diagnose_exception
 from extractor import (extract_invoice, validate, list_vendors, load_template, to_excel,
                        reconcile, detect_vendor, guess_vendor_name, pdf_text,
                        apply_rules, load_rules, check_duplicates, append_history,
@@ -50,17 +51,18 @@ go = st.button("Extract invoices", type="primary", disabled=not uploads,
 
 if go:
     settings = load_settings()
-    invoices, unmatched, rejected = [], [], []
+    invoices, unmatched, rejected, failed = [], [], [], []
     if len(uploads) > int(settings.get("max_batch_files", 100)):
         st.error(f"Too many files at once (limit {settings['max_batch_files']}).")
         st.stop()
     bar = st.progress(0.0, text="Reading invoices...")
     for i, up in enumerate(uploads, start=1):
         data = up.getbuffer().tobytes()
-        ok, msg = check_upload(data, safe_filename(up.name), settings)
-        if not ok:
-            rejected.append(msg)
-            log_event("upload_rejected", msg, outcome="rejected")
+        diag_up = check_upload_detailed(data, safe_filename(up.name), settings)
+        if not diag_up["ok"]:
+            diag_up["filename"] = up.name
+            rejected.append(diag_up)
+            log_event("upload_rejected", f"{up.name}: {diag_up['message']}", outcome="rejected")
             continue
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(data)
@@ -74,7 +76,16 @@ if go:
                 used_id = hit["id"]
             else:
                 used_id = vendor_choice["id"]
-            template = load_template(used_id)
+
+            try:
+                template = load_template(used_id)
+            except Exception as te:
+                d = diagnose_exception(te, filename=up.name, context="load_template")
+                d["title"] = f"Template '{used_id}' Not Found or Corrupted"
+                d["suggestion"] = f"Check if the template file for '{used_id}' exists in templates/ or re-create it in 'Add New Vendor'."
+                failed.append(d)
+                log_event("extract_failed", f"file={up.name} template={used_id} error={te}", outcome="error")
+                continue
 
             inv = validate(extract_invoice(tmp_path, template))
             inv.source_file = up.name
@@ -88,22 +99,49 @@ if go:
                     pass
             apply_rules(inv, vendor_id=used_id)
             invoices.append(inv)
+        except Exception as e:
+            diag_err = diagnose_exception(e, filename=up.name, context="extract_invoice")
+            failed.append(diag_err)
+            log_event("extract_failed", f"file={up.name} code={diag_err['code']} msg={diag_err['message']}", outcome="error")
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         bar.progress(i / len(uploads), text=f"Reading invoices... ({i}/{len(uploads)})")
     bar.empty()
 
     check_duplicates(invoices)
     log_event("extract_batch",
               f"files={len(uploads)} extracted={len(invoices)} "
-              f"unmatched={len(unmatched)} rejected={len(rejected)}")
+              f"unmatched={len(unmatched)} rejected={len(rejected)} failed={len(failed)}")
     ss.invoices = invoices
     ss.unmatched = unmatched
     ss.rejected = rejected
+    ss.failed = failed
 
 invoices = ss.get("invoices") or []
-for msg in (ss.get("rejected") or []):
-    st.error(f"🚫 {msg}")
+
+# Display upload rejections (invalid format, corrupted file, oversized, encrypted)
+for r in (ss.get("rejected") or []):
+    render_error_card(
+        title=r.get("title", "File Upload Rejected"),
+        message=r.get("message", "Invalid file"),
+        suggestion=r.get("suggestion", ""),
+        details=r.get("details", ""),
+        filename=r.get("filename", ""),
+        icon="🚫",
+    )
+
+# Display extraction failures (unreadable text, corrupted streams, template mismatch)
+for f in (ss.get("failed") or []):
+    render_error_card(
+        title=f.get("title", "Invoice Extraction Failed"),
+        message=f.get("message", "Extraction error"),
+        suggestion=f.get("suggestion", ""),
+        details=f.get("details", ""),
+        filename=f.get("filename", ""),
+        icon="❌",
+    )
+
 for name, guess in (ss.get("unmatched") or []):
     st.warning(f"⚠️ **{name}** — no matching template"
                + (f" (looks like **{guess}**)" if guess else "")

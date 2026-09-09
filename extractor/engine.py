@@ -534,17 +534,59 @@ def _select_variant(template: dict, page_text: str) -> dict:
 
 def extract_invoice(pdf_path: str, template: dict) -> Invoice:
     """Extract a single invoice PDF using the given vendor template."""
-    with pdfplumber.open(pdf_path) as pdf:
-        # combine words from all pages (most invoices are 1 page, but be safe)
-        all_words = []
-        page_offset = 0
-        for page in pdf.pages:
-            for w in page.extract_words():
-                w = dict(w)
-                w["text"] = clean_text(w["text"])
-                w["top"] = w["top"] + page_offset
-                all_words.append(w)
-            page_offset += page.height
+    import os
+    from .errors import (
+        CorruptedPDFError, EncryptedPDFError, EmptyFileError,
+        NoExtractableTextError, TemplateMismatchError, ExtractionError
+    )
+
+    filename = os.path.basename(pdf_path)
+
+    if not template or not isinstance(template, dict):
+        raise TemplateMismatchError(
+            f"No valid template configuration provided for '{filename}'.",
+            filename=filename
+        )
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if len(pdf.pages) == 0:
+                raise EmptyFileError(
+                    f"'{filename}' contains 0 pages.",
+                    filename=filename
+                )
+
+            # combine words from all pages (most invoices are 1 page, but be safe)
+            all_words = []
+            page_offset = 0
+            for page in pdf.pages:
+                for w in page.extract_words():
+                    w = dict(w)
+                    w["text"] = clean_text(w["text"])
+                    w["top"] = w["top"] + page_offset
+                    all_words.append(w)
+                page_offset += page.height
+    except (EmptyFileError, ExtractionError):
+        raise
+    except Exception as e:
+        low = str(e).lower()
+        if "password" in low or "encrypt" in low:
+            raise EncryptedPDFError(
+                f"'{filename}' is password-protected or encrypted: {e}",
+                filename=filename,
+                details=str(e)
+            ) from e
+        raise CorruptedPDFError(
+            f"Failed to read '{filename}' (PDF structure may be corrupted or damaged): {e}",
+            filename=filename,
+            details=str(e)
+        ) from e
+
+    if len(all_words) == 0:
+        raise NoExtractableTextError(
+            f"'{filename}' contains no selectable digital text words. It appears to be an image or scanned invoice.",
+            filename=filename
+        )
 
     lines = _cluster_lines(all_words)
 

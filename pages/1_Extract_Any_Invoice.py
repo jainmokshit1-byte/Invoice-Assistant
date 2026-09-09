@@ -15,9 +15,10 @@ from extractor import (extract_generic, validate, to_excel, reconcile, apply_rul
                        to_json, to_quickbooks_csv, to_tally_xml)
 from extractor.builder import LLM_PRESETS
 
-from extractor.ui import apply_theme, hero
-from extractor.security import (check_upload, safe_filename, log_event,
+from extractor.ui import apply_theme, hero, render_error_card
+from extractor.security import (check_upload, check_upload_detailed, safe_filename, log_event,
                                 load_settings, mask_key, is_local_provider)
+from extractor.errors import diagnose_exception
 
 st.set_page_config(page_title="Extract Any Invoice", page_icon="✨", layout="wide")
 apply_theme()
@@ -87,10 +88,11 @@ if uploads and st.button("Extract", type="primary", use_container_width=True):
             tmp = None
             try:
                 data = up.getbuffer().tobytes()
-                ok_up, msg_up = check_upload(data, safe_filename(up.name))
-                if not ok_up:
-                    errors.append(msg_up)
-                    log_event("upload_rejected", msg_up, outcome="rejected")
+                diag_up = check_upload_detailed(data, safe_filename(up.name))
+                if not diag_up["ok"]:
+                    diag_up["filename"] = up.name
+                    errors.append(diag_up)
+                    log_event("upload_rejected", f"{up.name}: {diag_up['message']}", outcome="rejected")
                     continue
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
                     f.write(data)
@@ -110,17 +112,9 @@ if uploads and st.button("Extract", type="primary", use_container_width=True):
                 apply_rules(inv, load_rules())
                 invoices.append(inv)
             except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if "model" in low and ("invalid" in low or "not found" in low or "does not exist" in low):
-                    msg += ("  →  The Model ID isn't valid for this provider/account. "
-                            "Open '① AI setup' and set a model you have access to "
-                            "(e.g. Anthropic: claude-sonnet-5, OpenAI: gpt-4o).")
-                elif "api key" in low or "authentication" in low or "401" in low or "unauthorized" in low:
-                    msg += "  →  Check your API key in '① AI setup'."
-                elif "connect" in low or "connection" in low:
-                    msg += "  →  Couldn't reach the provider. If using a local model, make sure it's running."
-                errors.append(f"{up.name}: {msg}")
+                diag_err = diagnose_exception(e, filename=up.name, context="extract_generic")
+                errors.append(diag_err)
+                log_event("ai_extract_failed", f"file={up.name} error={diag_err['code']}: {diag_err['message']}", outcome="error")
             finally:
                 if tmp and os.path.exists(tmp):
                     os.remove(tmp)
@@ -132,7 +126,17 @@ if uploads and st.button("Extract", type="primary", use_container_width=True):
 # ---------------- results ----------------
 invoices = ss.get("gen_results") or []
 for err in (ss.get("gen_errors") or []):
-    st.warning("⚠️ " + err)
+    if isinstance(err, dict):
+        render_error_card(
+            title=err.get("title", "Extraction Issue"),
+            message=err.get("message", "Error"),
+            suggestion=err.get("suggestion", ""),
+            details=err.get("details", ""),
+            filename=err.get("filename", ""),
+            icon="⚠️",
+        )
+    else:
+        st.warning("⚠️ " + str(err))
 
 if invoices:
     st.subheader("③ Results")
