@@ -16,7 +16,7 @@ CSS = """
       line-height: 1.62 !important;
       color: #14243A !important;
   }
-  .block-container { padding-top: 2rem; }
+  .block-container { padding-top: 2rem; padding-left: 1.25rem; padding-right: 1.25rem; }
 
   h1 { font-size: 2.15rem !important; font-weight: 800 !important; letter-spacing:-.02em; }
   h2 { font-size: 1.62rem !important; font-weight: 750 !important; }
@@ -25,7 +25,7 @@ CSS = """
   /* ---------- sidebar menu: bigger + brighter ---------- */
   section[data-testid="stSidebar"] {
       background: linear-gradient(180deg,#123A63 0%,#0E2E50 100%) !important;
-      min-width: 310px !important;
+      min-width: 280px !important;
   }
   section[data-testid="stSidebar"] * { color: #F2F7FF !important; }
   section[data-testid="stSidebar"] a,
@@ -61,6 +61,7 @@ CSS = """
   .stButton button, .stDownloadButton button {
       font-size: 1.06rem !important; font-weight: 700 !important;
       border-radius: 10px !important; padding: .55rem 1.05rem !important;
+      width: 100%;
   }
   .stButton button[kind="primary"], .stDownloadButton button[kind="primary"] {
       background: #1B6FCB !important; border-color:#1B6FCB !important;
@@ -70,12 +71,41 @@ CSS = """
   .stDataFrame, .stDataEditor, .stDataFrame div, .stDataEditor div {
       font-size: 1.0rem !important;
   }
+  div[data-testid="stDataFrame"] { overflow-x: auto !important; }
+  div[data-testid="stFileUploaderDropzone"] { padding: .9rem !important; }
   div[data-testid="stMetricValue"] { font-size: 2.0rem !important; font-weight: 800 !important; }
   div[data-testid="stMetricLabel"] { font-size: 1.02rem !important; font-weight: 650 !important; }
   div[data-testid="stAlert"] { font-size: 1.05rem !important; border-radius: 10px !important; }
   div[data-testid="stExpander"] summary p { font-size: 1.08rem !important; font-weight: 700 !important; }
   .stCaption, div[data-testid="stCaptionContainer"] p {
       font-size: .97rem !important; color:#40546E !important;
+  }
+  @media (max-width: 1024px) {
+    .block-container {
+      padding-left: .9rem !important;
+      padding-right: .9rem !important;
+    }
+    section[data-testid="stSidebar"] {
+      min-width: 230px !important;
+    }
+    div[data-testid="stHorizontalBlock"] {
+      gap: .5rem !important;
+    }
+    div[data-testid="column"] {
+      min-width: 100% !important;
+      flex: 1 1 100% !important;
+    }
+  }
+  @media (max-width: 640px) {
+    h1 { font-size: 1.65rem !important; }
+    h2 { font-size: 1.35rem !important; }
+    h3 { font-size: 1.15rem !important; }
+    section[data-testid="stSidebar"] {
+      min-width: 0 !important;
+    }
+    div[data-testid="stFileUploaderDropzone"] {
+      padding: .7rem !important;
+    }
   }
   #MainMenu, footer { visibility: hidden; }
 </style>
@@ -93,7 +123,7 @@ def hero(title: str, subtitle: str = "", color: str = "#1B4F86"):
     sub = f"<p style='margin:.4rem 0 0;opacity:.94;font-size:1.06rem'>{safe_subtitle}</p>" if safe_subtitle else ""
     st.markdown(
         f"""<div style="background:{color};color:#fff;border-radius:14px;
-                 padding:22px 26px;margin-bottom:20px;">
+                 padding:18px 18px;margin-bottom:16px;">
               <h1 style="margin:0;font-size:1.95rem;font-weight:800;color:#fff;">{safe_title}</h1>
               {sub}
             </div>""", unsafe_allow_html=True)
