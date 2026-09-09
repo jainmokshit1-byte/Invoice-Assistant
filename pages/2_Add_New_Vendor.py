@@ -168,7 +168,7 @@ elif method == "point":
         cands = B.field_candidates(words)
         st.caption("Each detected value is boxed and numbered. Click inside or near a box.")
         preview = B.render_preview(page["image"], page["scale"], cands, ss.pt_selected)
-        coords = streamlit_image_coordinates(preview, width=560, key="clicker")
+        coords = streamlit_image_coordinates(preview, key="clicker")
         if coords and coords.get("width"):
             x_pt = coords["x"] * page["width"] / coords["width"]
             y_pt = coords["y"] * page["height"] / coords["height"]
@@ -278,7 +278,7 @@ if method in ("point", "pick"):
                     else:
                         xs = [c["x0"] for c in ss.get("li_columns", [])]
                         prev = B.render_column_markers(page["image"], page["scale"], xs)
-                        lc = streamlit_image_coordinates(prev, width=560, key="liclick")
+                        lc = streamlit_image_coordinates(prev, key="liclick")
                         if lc and lc.get("width"):
                             xp = lc["x"] * page["width"] / lc["width"]
                             yp = lc["y"] * page["height"] / lc["height"]
