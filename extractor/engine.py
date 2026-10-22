@@ -534,12 +534,16 @@ def _select_variant(template: dict, page_text: str) -> dict:
 
 def extract_invoice(pdf_path: str, template: dict) -> Invoice:
     """Extract a single invoice PDF using the given vendor template."""
+    from .ocr import page_words
     with pdfplumber.open(pdf_path) as pdf:
         # combine words from all pages (most invoices are 1 page, but be safe)
         all_words = []
         page_offset = 0
-        for page in pdf.pages:
-            for w in page.extract_words():
+        ocr_used = False
+        for page_idx, page in enumerate(pdf.pages):
+            words, page_ocr = page_words(pdf_path, page, page_idx)  # scans/photos go through OCR
+            ocr_used |= page_ocr
+            for w in words:
                 w = dict(w)
                 w["text"] = clean_text(w["text"])
                 w["top"] = w["top"] + page_offset
@@ -554,7 +558,8 @@ def extract_invoice(pdf_path: str, template: dict) -> Invoice:
     template = _select_variant(template, page_text)
 
     import os
-    inv = Invoice(source_file=os.path.basename(pdf_path), vendor=template.get("vendor", ""))
+    inv = Invoice(source_file=os.path.basename(pdf_path), vendor=template.get("vendor", ""),
+                  ocr_used=ocr_used)
 
     core_fields = set(Invoice.model_fields.keys())
     for field_name, cfg in template.get("fields", {}).items():

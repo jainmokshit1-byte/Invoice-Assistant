@@ -78,10 +78,11 @@ def _norm(s):
 
 # ---------------------------------------------------------------- page reading
 def read_page(pdf_path):
+    from .ocr import page_words
     with pdfplumber.open(pdf_path) as pdf:
         words, offset = [], 0.0
-        for page in pdf.pages:
-            for w in page.extract_words():
+        for page_idx, page in enumerate(pdf.pages):
+            for w in page_words(pdf_path, page, page_idx)[0]:  # OCR words for scans/photos
                 w = dict(w)
                 w["text"] = clean_text(w["text"])
                 w["top"] = w["top"] + offset

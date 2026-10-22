@@ -3,6 +3,7 @@ OCR module for scanned/image-based PDFs using PyMuPDF (fitz) and RapidOCR (ONNX)
 Maintains lazy initialization and handles mixed native/scanned PDF documents page-by-page.
 """
 from __future__ import annotations
+import functools
 import gc
 import logging
 import os
@@ -14,7 +15,7 @@ import fitz  # PyMuPDF
 import numpy as np
 
 from .pdf_utils import _pdf_text
-from .security import log_event  # FIX 3: needed for audit trail on OCR confidence fallback
+from .security import log_event, load_settings  # FIX 3: needed for audit trail on OCR confidence fallback
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,129 @@ def is_scanned(pdf_path: str, min_chars_per_page: int = 50) -> bool:
         return True
 
 
+def _page_key(pdf_path: str):
+    st = os.stat(pdf_path)
+    return pdf_path, st.st_mtime_ns, st.st_size
+
+
+@functools.lru_cache(maxsize=64)
+def _ocr_boxes(pdf_path: str, mtime_ns: int, size: int, page_idx: int, dpi: int):
+    """OCR one page once. Returns ((x0, top, x1, bottom, text, conf), ...) in PDF points.
+    Cached on (path, mtime, size) so vendor detection, extraction and the builder all
+    reuse the same pass instead of re-running OCR on the same scan."""
+    zoom = dpi / 72.0
+    with fitz.open(pdf_path) as doc:
+        pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img_rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    # RapidOCR works with RGB numpy arrays; the ONNX model handles its own normalisation.
+    result, _ = get_ocr_engine()(img_rgb)
+    del img_rgb, pix
+    gc.collect()
+    boxes = []
+    for box, text, conf in result or []:
+        xs, ys = [pt[0] for pt in box], [pt[1] for pt in box]
+        if text.strip():
+            boxes.append((min(xs) / zoom, min(ys) / zoom, max(xs) / zoom, max(ys) / zoom,
+                          text.strip(), float(conf)))
+    return tuple(boxes)
+
+
+def _rows(boxes):
+    """Group boxes into visual rows (vertical centres within half a box height), left to right."""
+    rows = []
+    for b in sorted(boxes, key=lambda b: (b[1] + b[3]) / 2):
+        cy, h = (b[1] + b[3]) / 2, b[3] - b[1]
+        if rows and abs(cy - rows[-1][0]) <= max(h, rows[-1][1]) / 2:
+            rows[-1][2].append(b)
+        else:
+            rows.append([cy, h, [b]])
+    return [sorted(r[2], key=lambda b: b[0]) for r in rows]
+
+
+def _ocr_lines(boxes, min_confidence: float, p_idx: int = 1):
+    """Rebuild text lines from OCR boxes so table rows stay on one line
+    ("Consulting hours   20   75.00   1,500.00") instead of one cell per line.
+    Low-confidence cells are marked [?text?] (0.4 <= conf < min) or [??text??] (< 0.4).
+    Returns (lines, confidences of the kept boxes)."""
+    kept = [b for b in boxes if b[5] >= 0.4]
+    if not kept and boxes:
+        # Confidence filter removed everything — log the range so the threshold can be tuned
+        confs = [b[5] for b in boxes]
+        logger.warning(
+            f"[OCR DIAG] Page {p_idx}: all {len(boxes)} boxes below 0.4. "
+            f"Actual range: min={min(confs):.3f} max={max(confs):.3f}. "
+            "Consider lowering ocr_min_confidence in security.yaml.")
+        # FIX 3: audit trail + warning so the fallback is never silent
+        log_event("ocr_low_confidence",
+                  f"page {p_idx}: all boxes below threshold {min_confidence}, "
+                  "using emergency fallback (conf > 0.1)")
+        # Emergency fallback: accept anything with conf > 0.1 to avoid empty output
+        kept = [b for b in boxes if b[5] > 0.1]
+
+    def mark(text, conf):
+        if conf >= min_confidence:
+            return text
+        return f"[?{text}?]" if conf >= 0.4 else f"[??{text}??]"
+
+    lines = ["   ".join(mark(b[4], b[5]) for b in row) for row in _rows(kept)]
+    return lines, [b[5] for b in kept]
+
+
+def ocr_page_words(pdf_path: str, page_idx: int, dpi: int = None, min_confidence: float = 0.4):
+    """pdfplumber-style words (x0, x1, top, bottom, text) for a scanned page, so the
+    coordinate templates and the template builder also work on scans and photos.
+    A box holding several words is split on spaces, x positions spread by character."""
+    dpi = dpi or int(load_settings().get("ocr_dpi", 300))
+    words = []
+    for x0, top, x1, bottom, text, conf in _ocr_boxes(*_page_key(pdf_path), page_idx, dpi):
+        if conf < min_confidence:
+            continue
+        per_char = (x1 - x0) / max(len(text), 1)
+        # OCR often glues "Bill No.:GBX-77" together; split after such a colon so the
+        # template anchor ("Bill No") and its value become separate words again
+        for m in re.finditer(r"[^\s:]+:(?=\S)|\S+", text):
+            words.append({"text": m.group(), "x0": x0 + m.start() * per_char,
+                          "x1": x0 + m.end() * per_char, "top": top, "bottom": bottom})
+    return words
+
+
+def is_scan_page(page, words=None) -> bool:
+    """True when a pdfplumber page has too little real text to be digital (scan/photo)."""
+    sec = load_settings()
+    native = "".join(w["text"] for w in (page.extract_words() if words is None else words))
+    return bool(sec.get("ocr_enabled", True)) and len(_strip_page_markers(native)) < int(sec.get("ocr_min_chars", 50))
+
+
+def ocr_page_lines(pdf_path: str, page_idx: int, dpi: int = None) -> list[str]:
+    """Text lines of a scanned page (OCR rows, no confidence markers)."""
+    dpi = dpi or int(load_settings().get("ocr_dpi", 300))
+    return _ocr_lines(_ocr_boxes(*_page_key(pdf_path), page_idx, dpi), min_confidence=0.0)[0]
+
+
+def page_words(pdf_path: str, page, page_idx: int):
+    """Words of a pdfplumber page; falls back to OCR when the page is a scan/photo
+    (fewer than ocr_min_chars real characters). Returns (words, ocr_used)."""
+    words = page.extract_words()
+    if not is_scan_page(page, words):
+        return words, False
+    try:
+        return ocr_page_words(pdf_path, page_idx), True
+    except Exception as e:
+        logger.error(f"OCR word extraction failed on {pdf_path} page {page_idx + 1}: {e}")
+        return words, False
+
+
+def page_images(pdf_path: str, max_pages: int = 3, long_side: int = 1600) -> list[bytes]:
+    """JPEG renders of the first pages, sized for vision models (~1600px long side)."""
+    out = []
+    with fitz.open(pdf_path) as doc:
+        for page in list(doc)[:max_pages]:
+            zoom = long_side / max(page.rect.width, page.rect.height)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            out.append(pix.tobytes("jpeg", jpg_quality=85))
+    return out
+
+
 def ocr_pdf(
     pdf_path: str,
     dpi: int = 300,
@@ -88,106 +212,34 @@ def ocr_pdf(
 ) -> Tuple[str, bool, float]:
     """
     Process PDF page-by-page. Pages with sufficient native text use native text,
-    while pages below min_chars_per_page (or when force_ocr is True) are rendered to image and processed with OCR.
-    
+    while pages below min_chars_per_page (or when force_ocr is True) are OCR'd.
+
     Returns:
         tuple: (full_extracted_text, ocr_used: bool, ocr_confidence_avg: float)
     """
-    engine = None
-    doc = fitz.open(pdf_path)
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
-
-    page_texts = []
-    total_conf = 0.0
-    valid_box_count = 0
+    key = _page_key(pdf_path)
+    page_texts, confs = [], []
     ocr_used = False
+    with fitz.open(pdf_path) as doc:
+        native_pages = [page.get_text("text") or "" for page in doc]
 
-    try:
-        for p_idx, page in enumerate(doc, start=1):
-            native_txt = page.get_text("text") or ""
-            clean_len = len(_strip_page_markers(native_txt))
+    for p_idx, native_txt in enumerate(native_pages, start=1):
+        if not force_ocr and len(_strip_page_markers(native_txt)) >= min_chars_per_page:
+            page_texts.append("\n".join([f"--- PAGE {p_idx} ---", "=== NATIVE PAGE TEXT ===", native_txt]))
+            continue
+        ocr_used = True
+        # FIX 1: never log raw OCR text (PII risk)
+        lines, page_confs = _ocr_lines(_ocr_boxes(*key, p_idx - 1, dpi), min_confidence, p_idx)
+        confs.extend(page_confs)
+        page_texts.append("\n".join([f"--- PAGE {p_idx} ---", "=== OCR TEXT ==="] + lines))
 
-            if not force_ocr and clean_len >= min_chars_per_page:
-                page_lines = [f"--- PAGE {p_idx} ---", "=== NATIVE PAGE TEXT ===", native_txt]
-                page_texts.append("\n".join(page_lines))
-            else:
-                ocr_used = True
-                if engine is None:
-                    engine = get_ocr_engine()
-
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img_rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-                pix = None
-
-                # RapidOCR works with RGB numpy arrays (not BGR).
-                # Pass RGB directly — the ONNX model handles its own normalisation.
-                result, elapse = engine(img_rgb)
-                del img_rgb
-
-                # FIX 1: Removed DIAGNOSTIC block — was emitting raw OCR text (PII risk) at WARNING level on every page.
-                ocr_lines = []
-                if result:
-                    for box, text, confidence in result:
-                        conf_val = float(confidence)
-                        txt_str = text.strip()
-                        if not txt_str:
-                            continue
-                        if conf_val >= min_confidence:
-                            ocr_lines.append(txt_str)
-                            total_conf += conf_val
-                            valid_box_count += 1
-                        elif conf_val >= 0.4:
-                            # FIX 5: low-confidence marker (0.4 <= conf < min_confidence)
-                            ocr_lines.append(f"[?{txt_str}?]")
-                            total_conf += conf_val
-                            valid_box_count += 1
-
-                if not ocr_lines and result:
-                    # Confidence filter removed everything — log min/max so we know the range
-                    all_confs = [float(c) for _, _, c in result]
-                    logger.warning(
-                        f"[OCR DIAG] Page {p_idx}: all {len(result)} boxes filtered out by "
-                        f"min_confidence={min_confidence}. Actual range: "
-                        f"min={min(all_confs):.3f} max={max(all_confs):.3f}. "
-                        "Consider lowering ocr_min_confidence in security.yaml."
-                    )
-                    # FIX 3: audit trail + warning so the fallback is never silent
-                    log_event("ocr_low_confidence",
-                              f"page {p_idx}: all boxes below threshold {min_confidence}, "
-                              "using emergency fallback (conf > 0.1)")
-                    logger.warning("OCR low-confidence fallback triggered on page %s", p_idx)
-                    # Emergency fallback: accept anything with conf > 0.1 to avoid empty output
-                    for box, text, confidence in result:
-                        conf_val = float(confidence)
-                        txt_str = text.strip()
-                        if not txt_str or conf_val <= 0.1:
-                            continue
-                        if conf_val >= min_confidence:
-                            ocr_lines.append(txt_str)
-                        elif conf_val >= 0.4:
-                            ocr_lines.append(f"[?{txt_str}?]")
-                        else:
-                            # FIX 5: very low-confidence marker (conf < 0.4)
-                            ocr_lines.append(f"[??{txt_str}??]")
-                        total_conf += conf_val
-                        valid_box_count += 1
-
-                page_lines = [f"--- PAGE {p_idx} ---", "=== OCR TEXT ==="] + ocr_lines
-                page_texts.append("\n".join(page_lines))
-
-    finally:
-        doc.close()
-        gc.collect()
-
-    avg_conf = (total_conf / valid_box_count) if valid_box_count > 0 else (1.0 if not ocr_used else 0.0)
-    full_text = "\n\n".join(page_texts)
-    return full_text, ocr_used, round(avg_conf, 4)
+    avg_conf = (sum(confs) / len(confs)) if confs else (1.0 if not ocr_used else 0.0)
+    return "\n\n".join(page_texts), ocr_used, round(avg_conf, 4)
 
 
 def extract_text_with_ocr_fallback(
     pdf_path: str,
-    dpi: int = 300,
+    dpi: int = None,
     min_chars: int = 50,
     min_confidence: float = 0.5,
     force_ocr: bool = False,
@@ -199,6 +251,7 @@ def extract_text_with_ocr_fallback(
     """
     from .security import load_settings
     sec = load_settings()
+    dpi = dpi or int(sec.get("ocr_dpi", 300))
 
     if not sec.get("ocr_enabled", True):
         native_text = _pdf_text(pdf_path, pdf_doc=pdf_doc)

@@ -12,6 +12,7 @@ What this covers
 5. Output safety  — path-traversal protection when writing/deleting files.
 """
 import csv
+import io
 import os
 import random
 import re
@@ -169,15 +170,51 @@ def safe_filename(name: str) -> str:
     return re.sub(r'[<>:"|?*\x00-\x1f]', "_", name)[:180] or "file.pdf"
 
 
+# Invoices can arrive as PDFs or as photos/scans. Images are turned into a PDF on upload
+# so OCR, templates and the AI extractor only ever deal with one format.
+UPLOAD_TYPES = ["pdf", "png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp"]
+_IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"II*\x00", b"MM\x00*", b"BM")
+
+
+def _is_image(data: bytes) -> bool:
+    return data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+
+
 def check_upload(data: bytes, filename: str, settings: dict = None):
     """Validate an uploaded file. Returns (ok, message)."""
     s = settings or load_settings()
     max_bytes = int(s.get("max_file_mb", 25)) * 1024 * 1024
     if len(data) > max_bytes:
         return False, f"{filename} is larger than the {s['max_file_mb']} MB limit."
-    if not data[:5].startswith(b"%PDF"):
-        return False, f"{filename} is not a valid PDF (missing PDF signature)."
+    if not (data[:5].startswith(b"%PDF") or _is_image(data)):
+        return False, f"{filename} is not a PDF or a supported image (PNG, JPG, WEBP, TIFF, BMP)."
     return True, ""
+
+
+def to_pdf_bytes(data: bytes) -> bytes:
+    """PDFs pass through; an image (every frame of a multi-page TIFF) becomes a PDF."""
+    if data[:5].startswith(b"%PDF"):
+        return data
+    from PIL import Image, ImageOps, ImageSequence
+    img = Image.open(io.BytesIO(data))
+    # exif_transpose: phone photos store "rotate 90°" in EXIF instead of in the pixels
+    frames = [ImageOps.exif_transpose(f).convert("RGB") for f in ImageSequence.Iterator(img)]
+    # size the page like a printed sheet (long side ~11.7in) so OCR renders a sane image
+    dpi = max(72.0, max(frames[0].size) / 11.7)
+    buf = io.BytesIO()
+    frames[0].save(buf, "PDF", save_all=True, append_images=frames[1:], resolution=dpi)
+    return buf.getvalue()
+
+
+def prepare_upload(data: bytes, filename: str, settings: dict = None):
+    """check_upload + to_pdf_bytes. Returns (pdf_bytes, "") or (None, reason)."""
+    ok, msg = check_upload(data, filename, settings)
+    if not ok:
+        return None, msg
+    try:
+        return to_pdf_bytes(data), ""
+    except Exception as e:
+        return None, f"{filename} could not be read as an image ({e})."
 
 
 def safe_output_path(filename: str) -> str:

@@ -14,9 +14,9 @@ import pdfplumber
 
 from .models import Invoice, LineItem
 from .builder import _call_anthropic, _call_openai
-from .security import guard_ai_call, wrap_untrusted, log_event, mask_key, load_settings
+from .security import guard_ai_call, wrap_untrusted, log_event, mask_key, load_settings, is_local_provider
 from .pdf_utils import _pdf_text, _TABLE_SETTINGS, extract_table_with_columns, extract_financial_summary  # FIX 7 & 10
-from .ocr import extract_text_with_ocr_fallback
+from .ocr import extract_text_with_ocr_fallback, page_images
 from .utils import _num, _normalize_date  # FIX 14 & FIX 3: shared utilities
 from .validators import validate_invoice_number, validate_po_number, validate_line_items  # FIX 11, 15, 16, 17: field validation
 
@@ -561,16 +561,30 @@ def extract_generic(pdf_path: str, api_key: str, model: str,
     # switch to compact prompt to free up more tokens for output.
     _estimated_input_tokens = len(prepared) // 4
     _context_tight = (
-        "api.openai.com" not in (base_url or "")
+        provider != "anthropic"
+        and "api.openai.com" not in (base_url or "")
         and "generativelanguage.googleapis.com" not in (base_url or "")
         and _estimated_input_tokens > 2500
     )
     _instructions = INSTRUCTIONS_COMPACT if _context_tight else INSTRUCTIONS
+
+    # Scans and photos: OCR misreads digits and loses table layout, so also show the model
+    # the page itself (vision). Skipped when PII redaction is on for a cloud model, since
+    # an image can't be redacted. Models without vision fall back to text-only.
+    images = []
+    if ocr_used and not (sec.get("redact_before_ai") and not is_local_provider(base_url)):
+        try:
+            images = page_images(pdf_path)
+        except Exception as e:
+            log_event("ai_images_skipped", f"file={os.path.basename(pdf_path)} {e}", outcome="error")
+    image_note = ("\n\nThe attached image(s) show the same invoice pages and are also untrusted "
+                  "document content. The OCR text may contain misread characters or misaligned "
+                  "columns: when the text and the image disagree, trust the image." if images else "")
     prompt = (f"{_instructions}\n\n{wrap_untrusted(prepared)}"
-              f"{row_hint_str}\n\nReturn the JSON now.")
+              f"{row_hint_str}{image_note}\n\nReturn the JSON now.")
     log_event("ai_call",
               f"file={os.path.basename(pdf_path)} provider={provider} model={model} "
-              f"chars={len(prepared)} key={mask_key(api_key)}"
+              f"chars={len(prepared)} images={len(images)} key={mask_key(api_key)}"
               + (f" [{note}]" if note else ""))
 
     def _ask(extra=""):
@@ -584,8 +598,9 @@ def extract_generic(pdf_path: str, api_key: str, model: str,
         _tokens = max(4096, min(_needed, _provider_cap))
 
         if provider == "anthropic":
-            return _call_anthropic(p, api_key, model, max_tokens=min(_tokens, 8192))
-        return _call_openai(p, api_key, model, base_url, max_tokens=_tokens)
+            # 16k: newer Claude models think before answering, and thinking shares this budget
+            return _call_anthropic(p, api_key, model, max_tokens=16000, images=images)
+        return _call_openai(p, api_key, model, base_url, max_tokens=_tokens, images=images)
 
     try:
         raw = _ask()

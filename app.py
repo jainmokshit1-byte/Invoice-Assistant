@@ -17,7 +17,7 @@ from extractor.ui import (apply_theme, top_nav_bar, hero_card, section_header,
                           metric_card, analytics_sparkline_card, activity_card,
                           review_card, status_pill, money_columns, invoice_preview,
                           ICON_DOCUMENT, ICON_BUILDING, ICON_BOLT, ICON_SHIELD)
-from extractor.security import (check_upload, safe_filename, log_event, load_settings)
+from extractor.security import (prepare_upload, safe_filename, log_event, load_settings, UPLOAD_TYPES)
 from extractor import (extract_invoice, validate, list_vendors, load_template, to_excel,
                        reconcile, detect_vendor, guess_vendor_name, pdf_text,
                        apply_rules, load_rules, check_duplicates, append_history,
@@ -76,12 +76,12 @@ with left_col:
         st.info("No vendor templates installed yet. You can use **Extract Any Invoice** in the sidebar for one-offs, or create one in **Add New Vendor**.", icon=":material/info:")
 
     # ---- Step 2: upload ----
-    section_header("02", "Upload Invoices (PDF)")
+    section_header("02", "Upload Invoices (PDF or Image)")
     uploads = st.file_uploader(
-        "Drag and drop PDF files here",
-        type=["pdf"],
+        "Drag and drop PDFs or invoice photos here",
+        type=UPLOAD_TYPES,
         accept_multiple_files=True,
-        help="Upload single or multiple PDF invoices. Vector text and scanned documents are supported."
+        help="Digital PDFs, scanned PDFs and images (PNG, JPG, WEBP, TIFF, BMP). Scans and photos are read with OCR."
     )
 
     # ---- Step 3: extract ----
@@ -130,9 +130,8 @@ if extract_btn and uploads:
             bar.progress((i - 1) / n)
             step = f"[{i}/{n}] {up.name}"
             status.update(label=f"{step} · security checks")
-            data = up.getbuffer().tobytes()
-            ok, msg = check_upload(data, safe_filename(up.name), settings)
-            if not ok:
+            data, msg = prepare_upload(up.getbuffer().tobytes(), safe_filename(up.name), settings)
+            if data is None:
                 rejected.append(msg)
                 log_event("upload_rejected", msg, outcome="rejected")
                 st.write(f":material/block: **{up.name}** — rejected: {msg}")
@@ -158,12 +157,11 @@ if extract_btn and uploads:
                 inv.source_file = up.name
                 inv.extra["_file_hash"] = file_hash(tmp_path)
                 pdf_data[inv.extra["_file_hash"]] = data
-                if not getattr(inv, 'ocr_used', False):
-                    status.update(label=f"{step} · reconciling against printed totals")
-                    try:
-                        inv.reconciliation = reconcile(inv, tmp_path)
-                    except Exception:
-                        pass
+                status.update(label=f"{step} · reconciling against printed totals")
+                try:  # scans are checked against their OCR text
+                    inv.reconciliation = reconcile(inv, tmp_path)
+                except Exception:
+                    pass
                 status.update(label=f"{step} · applying business rules")
                 apply_rules(inv, vendor_id=used_id)
                 invoices.append(inv)

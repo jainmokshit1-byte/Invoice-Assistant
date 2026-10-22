@@ -14,13 +14,13 @@ import yaml
 
 from extractor import builder as B
 from extractor import autotemplate as AT
-from extractor.security import log_event
+from extractor.security import log_event, prepare_upload, safe_filename, UPLOAD_TYPES
 import importlib
 import extractor.ui
 importlib.reload(extractor.ui)
 
 from extractor.ui import (apply_theme, top_nav_bar, hero_card, section_header,
-                          metric_card, status_pill, ICON_PLUS)
+                          metric_card, status_pill, ai_provider_form, ai_config_problem, ICON_PLUS)
 
 try:
     # pyrefly: ignore [missing-import]
@@ -64,8 +64,13 @@ vendor_name = c_v1.text_input("Supplier / Vendor Name", placeholder="e.g. Acme C
 if vendor_name:
     ss["vendor_name_val"] = vendor_name
 
-sample = c_v2.file_uploader("Upload ONE sample invoice from this vendor (PDF)", type=["pdf"])
-if sample is not None:
+sample = c_v2.file_uploader("Upload ONE sample invoice from this vendor (PDF or image)", type=UPLOAD_TYPES)
+# only write a new temp file when a different file is uploaded, not on every rerun
+if sample is not None and ss.get("sample_id") != (sample.name, sample.size):
+    pdf_bytes, msg = prepare_upload(sample.getbuffer().tobytes(), safe_filename(sample.name))
+    if pdf_bytes is None:
+        st.error(msg, icon=":material/block:")
+        st.stop()
     prev_tmp = ss.get("sample_tmp_path")
     if prev_tmp and os.path.exists(prev_tmp):
         try:
@@ -73,8 +78,9 @@ if sample is not None:
         except OSError:
             pass
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(sample.getbuffer())
+        tmp.write(pdf_bytes)
         tmp_path = tmp.name
+    ss.sample_id = (sample.name, sample.size)
     ss.sample_tmp_path = tmp_path
     ss.sample_path = tmp_path
 
@@ -163,23 +169,16 @@ if method == "auto":
 # =====================================================================
 elif method == "ai":
     st.markdown("#### LLM-Assisted Template Synthesis")
-    preset_name = st.selectbox("Select Model Provider", list(B.LLM_PRESETS.keys()))
-    preset = B.LLM_PRESETS[preset_name]
-
-    base_url = None
-    if preset["provider"] == "openai":
-        base_url = st.text_input("API Base Endpoint", value=preset["base_url"])
-    model = st.text_input("Model Identifier", value=preset["model"])
-    env_key = os.environ.get(preset["key_env"], "") if preset.get("key_env") else ""
-    key = st.text_input("API Key", value=env_key, type="password", help="For local Ollama/vLLM, any string works.")
-
-    can_go = bool(vendor_name and model and (key or preset_name.startswith("Local")))
-    if st.button("Generate Template Definition with AI", type="primary", disabled=not can_go, use_container_width=True):
-        with st.spinner(f"Querying {preset_name} with document layout coordinates…"):
+    cfg = ai_provider_form("tpl")
+    problem = ai_config_problem(cfg) or ("" if vendor_name else "Enter the vendor name above.")
+    if problem:
+        st.caption(problem)
+    if st.button("Generate Template Definition with AI", type="primary", disabled=bool(problem), use_container_width=True):
+        with st.spinner(f"Querying {cfg['preset']} with document layout coordinates…"):
             try:
                 ss.draft_yaml = B.llm_generate_template(
-                    vendor_name, words, key or "ollama", model,
-                    provider=preset["provider"], base_url=base_url)
+                    vendor_name, words, cfg["api_key"], cfg["model"],
+                    provider=cfg["provider"], base_url=cfg["base_url"])
                 st.success("Draft YAML synthesized. Review below, test, and save.", icon=":material/check:")
             except Exception as e:
                 st.error(f"Generation failed: {e}")

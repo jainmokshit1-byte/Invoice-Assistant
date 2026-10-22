@@ -1835,3 +1835,68 @@ def invoice_preview(invoices: list, pdf_data: dict, key: str = "preview"):
             st.caption(f"• {note}")
         if inv.line_items:
             st.dataframe([li.cols for li in inv.line_items], hide_index=True, use_container_width=True)
+
+
+def ai_provider_form(key: str) -> dict:
+    """Provider / model / API key inputs used by every AI feature, plus a Test button.
+    Values are kept in st.session_state["ai_conn"], so a key entered on one page is
+    still there on the others (Streamlit drops widget state when you change page).
+    Returns {"preset", "provider", "model", "base_url", "api_key"}."""
+    import os
+    from .builder import LLM_PRESETS, test_connection
+    ss = st.session_state
+    conn = ss.setdefault("ai_conn", {})
+    names = list(LLM_PRESETS)
+    if conn.get("preset") not in names:
+        conn["preset"] = names[0]
+
+    # Widget values are seeded through session_state (Streamlit ignores `value=` for a
+    # widget it already knows), both after a page change and when the provider changes.
+    fields = {"model": "model", "key": "api_key", "base": "base_url"}
+    ss.setdefault(f"{key}_prov", conn["preset"])
+    for f, c in fields.items():
+        ss.setdefault(f"{key}_{f}", conn.get(c, ""))
+
+    c1, c2 = st.columns(2)
+    name = c1.selectbox("Provider", names, key=f"{key}_prov")
+    preset = LLM_PRESETS[name]
+    if name != conn["preset"] or "model" not in conn:  # new provider: load its defaults
+        conn.update(preset=name, model=preset["model"], base_url=preset["base_url"] or "",
+                    api_key=os.environ.get(preset["key_env"] or "", ""))
+        for f, c in fields.items():
+            ss[f"{key}_{f}"] = conn[c]
+
+    local = name.startswith("Local")
+    model = c2.text_input("Model ID", key=f"{key}_model",
+                          help="E.g. claude-sonnet-5, gpt-4o, gemini-2.5-flash, llama-3.3-70b-versatile.")
+    api_key = c1.text_input("API key" + (" (optional for local models)" if local else ""),
+                            type="password", key=f"{key}_key",
+                            help="Used only for this session; never written to disk or logs.")
+    base_url = preset["base_url"]
+    if local or name.startswith("Custom"):
+        base_url = c2.text_input("Base URL (OpenAI-compatible)", key=f"{key}_base",
+                                 help="E.g. http://localhost:11434/v1 for Ollama.")
+    conn.update(model=model.strip(), api_key=api_key.strip(), base_url=(base_url or "").strip())
+
+    cfg = {"preset": name, "provider": preset["provider"], "model": conn["model"],
+           "base_url": conn["base_url"] or None, "api_key": conn["api_key"]}
+    if st.button("Test connection", icon=":material/network_check:", key=f"{key}_test",
+                 disabled=not cfg["model"]):
+        with st.spinner(f"Contacting {name}…"):
+            try:
+                test_connection(cfg["provider"], cfg["api_key"], cfg["model"], cfg["base_url"])
+                st.success(f"Connected — {name} model `{cfg['model']}` is responding.", icon=":material/check_circle:")
+            except Exception as e:
+                st.error(str(e), icon=":material/error:")
+    return cfg
+
+
+def ai_config_problem(cfg: dict) -> str:
+    """Why this config can't be used yet, or "" if it looks complete."""
+    if not cfg["model"]:
+        return "Enter a model ID in the AI provider settings."
+    if cfg["provider"] == "openai" and not cfg["base_url"]:
+        return "Enter the base URL of your OpenAI-compatible endpoint."
+    if not cfg["api_key"] and not cfg["preset"].startswith("Local"):
+        return f"Enter your {cfg['preset']} API key in the AI provider settings."
+    return ""

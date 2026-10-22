@@ -16,12 +16,11 @@ importlib.reload(extractor.ui)
 from extractor import (extract_generic, validate, to_excel, reconcile, apply_rules,
                        load_rules, check_duplicates, append_history, file_hash,
                        to_json, to_quickbooks_csv, to_tally_xml)
-from extractor.builder import LLM_PRESETS
 from extractor.ui import (apply_theme, top_nav_bar, hero_card, section_header,
                           metric_card, analytics_sparkline_card, review_card, status_pill,
-                          money_columns, invoice_preview, ICON_AI)
-from extractor.security import (check_upload, safe_filename, log_event,
-                                load_settings, mask_key, is_local_provider)
+                          money_columns, invoice_preview, ai_provider_form, ai_config_problem, ICON_AI)
+from extractor.security import (prepare_upload, safe_filename, log_event,
+                                load_settings, UPLOAD_TYPES)
 
 st.set_page_config(page_title="Extract Any Invoice - Invoice AI", page_icon=":material/auto_awesome:", layout="wide")
 apply_theme()
@@ -30,8 +29,7 @@ top_nav_bar("AI GENERIC EXTRACTOR", search_placeholder="Extract arbitrary invoic
 ss = st.session_state
 _sec = load_settings()
 
-active_model_desc = ss.get("gen_cfg", {}).get("model", "gpt-4o") if ss.get("gen_cfg") else "Not configured"
-prov_name_display = ss.get("_gen_prov_last", "OpenAI")
+prov_name_display = ss.get("ai_conn", {}).get("preset", "Not configured")
 
 hero_card(
     title="Extract Any Invoice",
@@ -54,55 +52,29 @@ if _sec.get("redact_before_ai"):
     st.info("PII Guard Active: Personal and banking details will be sanitized before cloud submission.", icon=":material/shield:")
 
 # ---------------- AI provider setup ----------------
-with st.expander("Provider & Model Configuration", expanded=not ss.get("gen_ready"), icon=":material/settings:"):
-    prov_name = st.selectbox("Select Provider Preset", list(LLM_PRESETS.keys()), key="gen_prov")
-    preset = LLM_PRESETS[prov_name]
-    env_key = preset.get("key_env")
-    default_key = os.environ.get(env_key, "") if env_key else ""
-
-    if ss.get("_gen_prov_last") != prov_name:
-        ss["gen_model"] = preset.get("model", "")
-        ss["gen_key"] = default_key
-        ss["gen_base"] = preset.get("base_url") or ""
-        ss["_gen_prov_last"] = prov_name
-
-    col1, col2 = st.columns(2)
-    api_key = col1.text_input("API Key / Bearer Token", type="password", key="gen_key",
-                              help="Not required for local models (Ollama/vLLM).")
-    model = col2.text_input("Model ID", key="gen_model",
-                            help="E.g. gpt-4o, claude-sonnet-5, gemini-2.5-flash, llama-3.3-70b-versatile.")
-    base_url = preset.get("base_url")
-    if prov_name.startswith(("Custom", "Local")) or base_url == "":
-        base_url = st.text_input("Endpoint Base URL (OpenAI-compatible)", key="gen_base",
-                                 help="Local host endpoint, e.g. http://localhost:11434/v1 for Ollama.")
-
-    if st.button("Save & Activate Model Preset", type="primary", use_container_width=True):
-        ss.gen_ready = True
-        ss.gen_cfg = {
-            "provider": preset["provider"],
-            "model": model.strip(),
-            "base_url": base_url,
-            "api_key": api_key.strip()
-        }
-        log_event("ai_configured", f"provider={prov_name} model={model.strip()} key={mask_key(api_key)}")
-        st.success(f"Configured {prov_name} using model `{model.strip()}`.", icon=":material/check:")
+# Whatever is typed here is used directly — no separate "save" step to forget.
+# open on first visit unless a key is already configured; kept stable so it doesn't snap shut while typing
+ss.setdefault("gen_settings_open", not ss.get("ai_conn", {}).get("api_key"))
+with st.expander("Provider & Model Configuration", expanded=ss.gen_settings_open, icon=":material/settings:"):
+    cfg = ai_provider_form("gen")
 
 st.divider()
 
 # ---------------- upload & extract ----------------
 section_header("01", "Upload Invoices / Bills (Any Layout)")
 uploads = st.file_uploader(
-    "Drop one or more PDF files",
-    type=["pdf"],
+    "Drop PDFs or photos/scans of invoices",
+    type=UPLOAD_TYPES,
     accept_multiple_files=True,
-    help="Accepts native vector PDFs as well as scanned camera captures/images."
+    help="Digital PDFs, scanned PDFs, and images (PNG, JPG, WEBP, TIFF, BMP). Images are read with OCR "
+         "and, for vision-capable models, shown to the AI directly."
 )
 
 if uploads and st.button("Run AI Extraction Pipeline", icon=":material/play_arrow:", type="primary", use_container_width=True):
-    if not ss.get("gen_cfg"):
-        st.error("Please configure the AI provider settings above before extracting.")
+    if ai_config_problem(cfg):
+        st.error(ai_config_problem(cfg), icon=":material/settings:")
     else:
-        cfg = ss.gen_cfg
+        log_event("ai_configured", f"provider={cfg['preset']} model={cfg['model']}")
         invoices, errors, pdf_data = [], [], {}
         n = len(uploads)
         with st.status(f"Extracting {n} invoice(s) with {cfg['model']}…", expanded=True) as status:
@@ -113,9 +85,8 @@ if uploads and st.button("Run AI Extraction Pipeline", icon=":material/play_arro
                 status.update(label=f"{step} · security checks")
                 tmp = None
                 try:
-                    data = up.getbuffer().tobytes()
-                    ok_up, msg_up = check_upload(data, safe_filename(up.name))
-                    if not ok_up:
+                    data, msg_up = prepare_upload(up.getbuffer().tobytes(), safe_filename(up.name))
+                    if data is None:
                         errors.append(msg_up)
                         log_event("upload_rejected", msg_up, outcome="rejected")
                         st.write(f":material/block: **{up.name}** — rejected: {msg_up}")
@@ -130,12 +101,11 @@ if uploads and st.button("Run AI Extraction Pipeline", icon=":material/play_arro
                     inv.source_file = up.name
                     inv.extra["_file_hash"] = file_hash(tmp)
                     pdf_data[inv.extra["_file_hash"]] = data
-                    if not getattr(inv, 'ocr_used', False):
-                        status.update(label=f"{step} · reconciling against printed totals")
-                        try:
-                            inv.reconciliation = reconcile(inv, tmp)
-                        except Exception:
-                            pass
+                    status.update(label=f"{step} · reconciling against printed totals")
+                    try:  # scans are checked against their OCR text
+                        inv.reconciliation = reconcile(inv, tmp)
+                    except Exception:
+                        pass
                     status.update(label=f"{step} · applying business rules")
                     apply_rules(inv, load_rules())
                     invoices.append(inv)

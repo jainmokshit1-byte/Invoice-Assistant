@@ -7,7 +7,7 @@
 ![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED.svg)
 
-**Invoice Assistant** is an enterprise-grade, privacy-first invoice intelligence and accounts payable (AP) automation platform. It extracts structured data from **any PDF invoice** — whether digital/vector or scanned paper receipts — validates arithmetic consistency, enforces business compliance rules, flags duplicate submissions, and exports accounting-ready records to **Excel (.xlsx)**, **Tally Prime XML**, **QuickBooks CSV**, and **JSON**.
+**Invoice Assistant** is an enterprise-grade, privacy-first invoice intelligence and accounts payable (AP) automation platform. It extracts structured data from **any invoice PDF or image** — digital/vector PDFs, scanned paper, or phone photos (PNG, JPG, WEBP, TIFF, BMP; images are converted to PDF, OCR'd, and shown to vision-capable AI models) — validates arithmetic consistency, enforces business compliance rules, flags duplicate submissions, and exports accounting-ready records to **Excel (.xlsx)**, **Tally Prime XML**, **QuickBooks CSV**, and **JSON**.
 
 ---
 

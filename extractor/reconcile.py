@@ -16,9 +16,16 @@ TOL = 1.5  # rupees/dollars of slack for rounding differences
 
 
 def _pdf_lines(pdf_path):
+    from .ocr import is_scan_page, ocr_page_lines
     out = []
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        for i, page in enumerate(pdf.pages):
+            if is_scan_page(page):  # scans/photos: compare against what OCR reads
+                try:
+                    out.extend(ocr_page_lines(pdf_path, i))
+                    continue
+                except Exception:
+                    pass
             txt = page.extract_text() or ""
             out.extend(l for l in txt.splitlines() if l.strip())
     return out

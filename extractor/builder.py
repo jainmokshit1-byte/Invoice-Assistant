@@ -40,11 +40,12 @@ def default_type(name: str) -> str:
 def load_page(pdf_path: str, resolution: int = 120):
     """Return words (with coordinates), page size in points, a PIL image of the
     page, and the pixels-per-point scale used to render it."""
+    from .ocr import page_words
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
         from .engine import clean_text
         words = []
-        for w in page.extract_words():
+        for w in page_words(pdf_path, page, 0)[0]:  # OCR words when the sample is a scan/photo
             w = dict(w)
             w["text"] = clean_text(w["text"])
             words.append(w)
@@ -612,56 +613,117 @@ LLM_PRESETS = {
 }
 
 
-def _call_anthropic(prompt, api_key, model, max_tokens=1500):
+def _api_error(sdk, e, model):
+    """Turn an SDK exception into a RuntimeError that says what to fix."""
+    if isinstance(e, sdk.AuthenticationError):
+        why = "the API key was rejected (401). Check the key belongs to this provider"
+    elif isinstance(e, sdk.PermissionDeniedError):
+        why = "this key has no access to the model or endpoint (403)"
+    elif isinstance(e, sdk.NotFoundError):
+        why = f"model '{model}' or the endpoint URL was not found (404). Check the model ID and base URL"
+    elif isinstance(e, sdk.RateLimitError):
+        why = "rate limit or quota exceeded (429). Wait a minute or check the account's billing"
+    elif isinstance(e, sdk.APITimeoutError):
+        why = ("the request timed out. For a local model on CPU, raise the AI_TIMEOUT "
+               "environment variable (seconds) or use a smaller model")
+    elif isinstance(e, sdk.APIConnectionError):
+        why = "could not connect. Check the base URL / network, or that the local server is running"
+    else:
+        why = str(e)
+    return RuntimeError(f"AI call failed: {why}. ({type(e).__name__}: {e})")
+
+
+def _call_anthropic(prompt, api_key, model, max_tokens=16000, images=None):
+    """`images`: optional JPEG page renders, sent alongside the text for scanned invoices."""
     import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(model=model, max_tokens=max_tokens,
-                                 messages=[{"role": "user", "content": prompt}])
+    import base64
+    client = anthropic.Anthropic(api_key=api_key or None,
+                                 timeout=float(os.environ.get("AI_TIMEOUT", "600")))
+    blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                          "data": base64.standard_b64encode(img).decode()}}
+              for img in images or []]
+    try:
+        msg = client.messages.create(model=model, max_tokens=max_tokens,
+                                     messages=[{"role": "user", "content": blocks + [{"type": "text", "text": prompt}]}])
+    except anthropic.BadRequestError as e:
+        if images:  # e.g. an image the API won't take: the OCR text alone still works
+            return _call_anthropic(prompt, api_key, model, max_tokens)
+        raise _api_error(anthropic, e, model) from e
+    except anthropic.AnthropicError as e:
+        raise _api_error(anthropic, e, model) from e
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 
 
-def _call_openai(prompt, api_key, model, base_url, max_tokens=4096):
+def _call_openai(prompt, api_key, model, base_url, max_tokens=4096, images=None):
     """Works with OpenAI and any OpenAI-compatible endpoint (Gemini, Groq, OpenRouter,
-    Mistral, Together, local Ollama/LM Studio, ...)."""
-    from openai import OpenAI, APITimeoutError
+    Mistral, Together, local Ollama/LM Studio, ...). `images`: optional JPEG page
+    renders; models without vision reject them, and the call is retried text-only."""
+    import base64
+    import openai
+    from openai import OpenAI
     timeout_s = float(os.environ.get("AI_TIMEOUT", "600"))
-    _timed_out = RuntimeError(
-        f"The connection to the AI server timed out (took longer than {timeout_s:.0f} "
-        "seconds). If you're using a local model on CPU, raise it by setting the "
-        "AI_TIMEOUT environment variable (e.g. AI_TIMEOUT=600), or use a faster/smaller "
-        "model. Otherwise the server may be overloaded or out of GPU memory.")
     client = OpenAI(api_key=api_key or "not-needed", base_url=(base_url or None), timeout=timeout_s)
-    kwargs = dict(model=model, messages=[{"role": "user", "content": prompt}])
 
+    def content(with_images):
+        if not with_images:
+            return prompt
+        return [{"type": "text", "text": prompt}] + [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.standard_b64encode(img).decode()}}
+            for img in images]
+
+    # Account/model/network problems won't be fixed by tweaking request parameters: stop at once.
+    fatal = (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError,
+             openai.RateLimitError, openai.APIConnectionError)
     last_exc = None
     _NATIVE_JSON_HOSTS = ("api.openai.com", "api.anthropic.com")
     _is_native = any(h in (base_url or "") for h in _NATIVE_JSON_HOSTS)
     _formats = [{"type": "json_object"}, None] if _is_native else [None]
     _extra_bodies = [{"chat_template_kwargs": {"enable_thinking": False}}, None] if not _is_native else [None]
 
-    for eb in _extra_bodies:
-        for fmt in _formats:
-            for token_kw in [{"max_tokens": max_tokens}, {"max_completion_tokens": max_tokens}, {}]:
-                try:
-                    call_kwargs = dict(**kwargs, **token_kw)
-                    if fmt:
-                        call_kwargs["response_format"] = fmt
-                    if eb:
-                        call_kwargs["extra_body"] = eb
-                    resp = client.chat.completions.create(**call_kwargs)
-                    content = resp.choices[0].message.content or ""
-                    if content.strip():
-                        return content
-                except APITimeoutError as e:
-                    raise _timed_out from e
-                except Exception as e:
-                    last_exc = e
-                    continue
+    # Providers differ in which optional parameters they accept (response_format,
+    # max_tokens vs max_completion_tokens, vLLM's chat_template_kwargs): try variants.
+    for with_images in ([True, False] if images else [False]):
+        for eb in _extra_bodies:
+            for fmt in _formats:
+                for token_kw in [{"max_tokens": max_tokens}, {"max_completion_tokens": max_tokens}, {}]:
+                    try:
+                        call_kwargs = dict(model=model, messages=[{"role": "user", "content": content(with_images)}],
+                                           **token_kw)
+                        if fmt:
+                            call_kwargs["response_format"] = fmt
+                        if eb:
+                            call_kwargs["extra_body"] = eb
+                        resp = client.chat.completions.create(**call_kwargs)
+                        text = resp.choices[0].message.content or ""
+                        if text.strip():
+                            return text
+                    except fatal as e:
+                        raise _api_error(openai, e, model) from e
+                    except Exception as e:
+                        last_exc = e
+                        continue
     if last_exc is not None:
         raise RuntimeError(
             f"All API call attempts failed. Last error: {last_exc}"
         ) from last_exc
     return ""
+
+
+def test_connection(provider, api_key, model, base_url=None) -> str:
+    """Send a tiny prompt to check key, model and URL. Returns the reply; raises with
+    a readable reason. Respects the Security page's cloud lock."""
+    from .security import guard_ai_call
+    allowed, _, note = guard_ai_call("ping", provider, base_url)
+    if not allowed:
+        raise PermissionError(note)
+    prompt = 'Reply with exactly this JSON and nothing else: {"ok": true}'
+    if provider == "anthropic":
+        reply = _call_anthropic(prompt, api_key, model, max_tokens=1024)
+    else:
+        reply = _call_openai(prompt, api_key, model, base_url, max_tokens=256)
+    if not reply.strip():
+        raise RuntimeError("The model answered with an empty reply. Check the model ID.")
+    return reply.strip()
 
 
 def llm_generate_template(vendor_name, words, api_key, model,
@@ -670,6 +732,10 @@ def llm_generate_template(vendor_name, words, api_key, model,
     provider: provider='anthropic' uses Claude natively; provider='openai' uses the
     OpenAI-compatible API (set base_url for OpenAI, Gemini, Groq, Ollama, etc.).
     Returns YAML text. Raises on failure so the caller can show the error."""
+    from .security import guard_ai_call
+    allowed, _, note = guard_ai_call("", provider, base_url)  # honour the cloud lock here too
+    if not allowed:
+        raise PermissionError(note)
     prompt = (
         f"{SCHEMA_DOC}\n\n"
         f"VENDOR NAME: {vendor_name}\n\n"
