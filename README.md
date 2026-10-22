@@ -167,4 +167,4 @@ CI runs the suite on every push (`.github/workflows/ci.yml`).
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).
