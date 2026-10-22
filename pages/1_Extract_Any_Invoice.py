@@ -19,7 +19,7 @@ from extractor import (extract_generic, validate, to_excel, reconcile, apply_rul
 from extractor.builder import LLM_PRESETS
 from extractor.ui import (apply_theme, top_nav_bar, hero_card, section_header,
                           metric_card, analytics_sparkline_card, review_card, status_pill,
-                          ICON_AI)
+                          money_columns, invoice_preview, ICON_AI)
 from extractor.security import (check_upload, safe_filename, log_event,
                                 load_settings, mask_key, is_local_provider)
 
@@ -103,50 +103,68 @@ if uploads and st.button("Run AI Extraction Pipeline", icon=":material/play_arro
         st.error("Please configure the AI provider settings above before extracting.")
     else:
         cfg = ss.gen_cfg
-        invoices, errors = [], []
-        prog = st.progress(0.0, text="Initializing extraction…")
-        for i, up in enumerate(uploads, start=1):
-            prog.progress(i / len(uploads), text=f"Processing {up.name} ({i}/{len(uploads)})…")
-            tmp = None
-            try:
-                data = up.getbuffer().tobytes()
-                ok_up, msg_up = check_upload(data, safe_filename(up.name))
-                if not ok_up:
-                    errors.append(msg_up)
-                    log_event("upload_rejected", msg_up, outcome="rejected")
-                    continue
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-                    f.write(data)
-                    tmp = f.name
-                inv = extract_generic(
-                    tmp, api_key=cfg["api_key"], model=cfg["model"],
-                    provider=cfg["provider"], base_url=cfg["base_url"])
-                inv.source_file = up.name
-                inv.extra["_file_hash"] = file_hash(tmp)
-                if not getattr(inv, 'ocr_used', False):
-                    try:
-                        inv.reconciliation = reconcile(inv, tmp)
-                    except Exception:
-                        pass
-                apply_rules(inv, load_rules())
-                invoices.append(inv)
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if "model" in low and ("invalid" in low or "not found" in low or "does not exist" in low):
-                    msg += " → Model ID not found. Verify your provider model string."
-                elif "api key" in low or "authentication" in low or "401" in low:
-                    msg += " → Authentication failed. Verify API Key."
-                elif "connect" in low or "connection" in low:
-                    msg += " → Server unreachable. Ensure local AI runner is active."
-                errors.append(f"{up.name}: {msg}")
-            finally:
-                if tmp and os.path.exists(tmp):
-                    os.remove(tmp)
-        prog.empty()
-        check_duplicates(invoices)
+        invoices, errors, pdf_data = [], [], {}
+        n = len(uploads)
+        with st.status(f"Extracting {n} invoice(s) with {cfg['model']}…", expanded=True) as status:
+            prog = st.progress(0.0)
+            for i, up in enumerate(uploads, start=1):
+                prog.progress((i - 1) / n)
+                step = f"[{i}/{n}] {up.name}"
+                status.update(label=f"{step} · security checks")
+                tmp = None
+                try:
+                    data = up.getbuffer().tobytes()
+                    ok_up, msg_up = check_upload(data, safe_filename(up.name))
+                    if not ok_up:
+                        errors.append(msg_up)
+                        log_event("upload_rejected", msg_up, outcome="rejected")
+                        st.write(f":material/block: **{up.name}** — rejected: {msg_up}")
+                        continue
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+                        f.write(data)
+                        tmp = f.name
+                    status.update(label=f"{step} · reading text (OCR if scanned) and querying AI model")
+                    inv = extract_generic(
+                        tmp, api_key=cfg["api_key"], model=cfg["model"],
+                        provider=cfg["provider"], base_url=cfg["base_url"])
+                    inv.source_file = up.name
+                    inv.extra["_file_hash"] = file_hash(tmp)
+                    pdf_data[inv.extra["_file_hash"]] = data
+                    if not getattr(inv, 'ocr_used', False):
+                        status.update(label=f"{step} · reconciling against printed totals")
+                        try:
+                            inv.reconciliation = reconcile(inv, tmp)
+                        except Exception:
+                            pass
+                    status.update(label=f"{step} · applying business rules")
+                    apply_rules(inv, load_rules())
+                    invoices.append(inv)
+                    st.write(f":material/check_circle: **{up.name}** — {inv.vendor} #{inv.invoice_number or 'N/A'}"
+                             + (" · OCR" if getattr(inv, "ocr_used", False) else "")
+                             + ("" if inv.validation_ok else " · needs review"))
+                except Exception as e:
+                    msg = str(e)
+                    low = msg.lower()
+                    if "model" in low and ("invalid" in low or "not found" in low or "does not exist" in low):
+                        msg += " → Model ID not found. Verify your provider model string."
+                    elif "api key" in low or "authentication" in low or "401" in low:
+                        msg += " → Authentication failed. Verify API Key."
+                    elif "connect" in low or "connection" in low:
+                        msg += " → Server unreachable. Ensure local AI runner is active."
+                    errors.append(f"{up.name}: {msg}")
+                    st.write(f":material/error: **{up.name}** — failed (details below)")
+                finally:
+                    if tmp and os.path.exists(tmp):
+                        os.remove(tmp)
+            prog.progress(1.0)
+            status.update(label="Checking for duplicates")
+            check_duplicates(invoices)
+            summary = f"Extracted {len(invoices)} of {n} invoice(s)" + (f" · {len(errors)} failed" if errors else "")
+            status.update(label=summary, state="complete" if invoices else "error", expanded=False)
+        st.toast(summary, icon=":material/task_alt:" if invoices else ":material/error:")
         ss.gen_results = invoices
         ss.gen_errors = errors
+        ss.gen_pdf_data = pdf_data
 
 # ---------------- results ----------------
 invoices = ss.get("gen_results") or []
@@ -197,7 +215,13 @@ if invoices:
             "Audit": "PASS" if inv.validation_ok else "CHECK"
         }
         inv_rows.append(row)
-    st.dataframe(inv_rows, hide_index=True, use_container_width=True)
+    st.dataframe(inv_rows, hide_index=True, use_container_width=True,
+                 column_config={"File": st.column_config.TextColumn("File", width="medium"),
+                                **money_columns("Subtotal", "Tax", "Total")})
+
+    st.markdown("#### Document Preview")
+    st.caption("Compare the extracted values with the original invoice before exporting.")
+    invoice_preview(invoices, ss.get("gen_pdf_data") or {}, key="ai_preview")
 
     # Line Items Section
     line_rows = []
@@ -234,7 +258,9 @@ if invoices:
             "Line Items Sum": inv.reconciliation.get("line_items_sum"),
             "# Lines": inv.reconciliation.get("n_line_items"),
             "Notes": inv.reconciliation.get("notes"),
-        } for inv in recon], hide_index=True, use_container_width=True)
+        } for inv in recon], hide_index=True, use_container_width=True,
+            column_config={"Notes": st.column_config.TextColumn("Notes", width="large"),
+                           **money_columns("Printed Total", "Extracted Total", "Line Items Sum")})
 
     section_header("03", "One-Click Multi-Format Export Center")
     with tempfile.TemporaryDirectory() as d:

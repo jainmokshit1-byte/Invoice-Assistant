@@ -15,7 +15,7 @@ importlib.reload(extractor.ui)
 
 from extractor.ui import (apply_theme, top_nav_bar, hero_card, section_header,
                           metric_card, analytics_sparkline_card, activity_card,
-                          review_card, status_pill,
+                          review_card, status_pill, money_columns, invoice_preview,
                           ICON_DOCUMENT, ICON_BUILDING, ICON_BOLT, ICON_SHIELD)
 from extractor.security import (check_upload, safe_filename, log_event, load_settings)
 from extractor import (extract_invoice, validate, list_vendors, load_template, to_excel,
@@ -118,54 +118,73 @@ with right_col:
 # Execution Logic
 if extract_btn and uploads:
     settings = load_settings()
-    invoices, unmatched, rejected = [], [], []
+    invoices, unmatched, rejected, pdf_data = [], [], [], {}
     if len(uploads) > int(settings.get("max_batch_files", 100)):
         st.error(f"Batch size exceeds current threshold limit of {settings['max_batch_files']} documents.")
         st.stop()
 
-    bar = st.progress(0.0, text="Initializing batch extraction...")
-    for i, up in enumerate(uploads, start=1):
-        data = up.getbuffer().tobytes()
-        ok, msg = check_upload(data, safe_filename(up.name), settings)
-        if not ok:
-            rejected.append(msg)
-            log_event("upload_rejected", msg, outcome="rejected")
-            continue
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        try:
-            if vendor_choice["id"] == "__auto__":
-                hit = detect_vendor(tmp_path)
-                if not hit:
-                    unmatched.append((up.name, guess_vendor_name(pdf_text(tmp_path))))
-                    continue
-                used_id = hit["id"]
-            else:
-                used_id = vendor_choice["id"]
-            template = load_template(used_id)
+    n = len(uploads)
+    with st.status(f"Extracting {n} invoice(s)…", expanded=True) as status:
+        bar = st.progress(0.0)
+        for i, up in enumerate(uploads, start=1):
+            bar.progress((i - 1) / n)
+            step = f"[{i}/{n}] {up.name}"
+            status.update(label=f"{step} · security checks")
+            data = up.getbuffer().tobytes()
+            ok, msg = check_upload(data, safe_filename(up.name), settings)
+            if not ok:
+                rejected.append(msg)
+                log_event("upload_rejected", msg, outcome="rejected")
+                st.write(f":material/block: **{up.name}** — rejected: {msg}")
+                continue
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            try:
+                if vendor_choice["id"] == "__auto__":
+                    status.update(label=f"{step} · detecting vendor")
+                    hit = detect_vendor(tmp_path)
+                    if not hit:
+                        unmatched.append((up.name, guess_vendor_name(pdf_text(tmp_path))))
+                        st.write(f":material/help: **{up.name}** — no matching vendor template")
+                        continue
+                    used_id = hit["id"]
+                else:
+                    used_id = vendor_choice["id"]
+                template = load_template(used_id)
 
-            inv = validate(extract_invoice(tmp_path, template))
-            inv.source_file = up.name
-            inv.extra["_file_hash"] = file_hash(tmp_path)
-            if not getattr(inv, 'ocr_used', False):
-                try:
-                    inv.reconciliation = reconcile(inv, tmp_path)
-                except Exception:
-                    pass
-            apply_rules(inv, vendor_id=used_id)
-            invoices.append(inv)
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        bar.progress(i / len(uploads), text=f"Processing {up.name} ({i}/{len(uploads)})")
-    bar.empty()
+                status.update(label=f"{step} · extracting fields ({used_id} template)")
+                inv = validate(extract_invoice(tmp_path, template))
+                inv.source_file = up.name
+                inv.extra["_file_hash"] = file_hash(tmp_path)
+                pdf_data[inv.extra["_file_hash"]] = data
+                if not getattr(inv, 'ocr_used', False):
+                    status.update(label=f"{step} · reconciling against printed totals")
+                    try:
+                        inv.reconciliation = reconcile(inv, tmp_path)
+                    except Exception:
+                        pass
+                status.update(label=f"{step} · applying business rules")
+                apply_rules(inv, vendor_id=used_id)
+                invoices.append(inv)
+                st.write(f":material/check_circle: **{up.name}** — {inv.vendor} #{inv.invoice_number or 'N/A'}"
+                         + ("" if inv.validation_ok else " · needs review"))
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        bar.progress(1.0)
+        status.update(label="Checking for duplicates")
+        check_duplicates(invoices)
+        summary = f"Extracted {len(invoices)} of {n} invoice(s)" + "".join(
+            f" · {c} {lbl}" for c, lbl in ((len(unmatched), "unmatched"), (len(rejected), "rejected")) if c)
+        status.update(label=summary, state="complete" if invoices else "error", expanded=False)
+    st.toast(summary, icon=":material/task_alt:" if invoices else ":material/error:")
 
-    check_duplicates(invoices)
     log_event("extract_batch", f"files={len(uploads)} extracted={len(invoices)} unmatched={len(unmatched)} rejected={len(rejected)}")
     ss.invoices = invoices
     ss.unmatched = unmatched
     ss.rejected = rejected
+    ss.pdf_data = pdf_data
 
 # Notifications & Alerts
 invoices = ss.get("invoices") or []
@@ -232,6 +251,8 @@ if invoices:
         hide_index=True,
         use_container_width=True,
         disabled=["File"],
+        column_config={"File": st.column_config.TextColumn("File", width="medium"),
+                       **money_columns("Subtotal", "Tax", "Total")},
         key="hdr_editor"
     )
 
@@ -245,14 +266,19 @@ if invoices:
             v = row[f]
             setattr(inv, f.lower(), _safe_float(v))
 
+    # Side-by-side verification against the original document
+    st.markdown("#### Document Preview")
+    st.caption("Compare the extracted values with the original invoice before exporting.")
+    invoice_preview(invoices, ss.get("pdf_data") or {}, key="tpl_preview")
+
     # Line Items
     with st.expander("Itemized Line Items Breakdown", expanded=False, icon=":material/inventory_2:"):
-        for inv in invoices:
+        for li_idx, inv in enumerate(invoices):
             st.markdown(f"**{inv.source_file}** &nbsp;·&nbsp; `Invoice #{inv.invoice_number or 'N/A'}`")
             rows = [dict(li.cols) for li in inv.line_items]
             if rows:
                 ed = st.data_editor(rows, hide_index=True, use_container_width=True,
-                                    num_rows="dynamic", key=f"li_{inv.source_file}")
+                                    num_rows="dynamic", key=f"li_{li_idx}")
                 for li, r in zip(inv.line_items, ed):
                     li.cols.update(r)
                 summable = set(inv.line_total_columns or [])
@@ -280,7 +306,10 @@ if invoices:
                 "Line Items Sum": i.reconciliation.get("line_items_sum"),
                 "# Lines": i.reconciliation.get("n_line_items"),
                 "Audit Notes": i.reconciliation.get("notes"),
-            } for i in recon], use_container_width=True, hide_index=True)
+            } for i in recon], use_container_width=True, hide_index=True,
+               column_config={"Audit Notes": st.column_config.TextColumn("Audit Notes", width="large"),
+                              **money_columns("Printed Total", "Extracted Total", "Printed Subtotal",
+                                              "Extracted Subtotal", "Line Items Sum")})
 
     # Per-Invoice Verification Cards (matching the reference image's review cards)
     st.markdown("#### Document Verification Cards")
@@ -289,7 +318,12 @@ if invoices:
         target_col = rev_c1 if idx % 2 == 0 else rev_c2
         status_sym = "PASS" if inv.validation_ok else "REVIEW"
         rating_lbl = "100% Reconciled" if inv.validation_ok else "Review Flagged"
-        notes_str = "; ".join(inv.validation_notes) if inv.validation_notes else f"Total payable: {inv.total:,.2f} verified against printed anchors."
+        if inv.validation_notes:
+            notes_str = "; ".join(inv.validation_notes)
+        elif inv.total is None:
+            notes_str = "Total payable is empty — enter it in the header table above."
+        else:
+            notes_str = f"Total payable: {inv.total:,.2f} verified against printed anchors."
         with target_col:
             review_card(
                 author=f"{inv.vendor} — #{inv.invoice_number or 'Unspecified'}",

@@ -1785,3 +1785,53 @@ def status_pill(text: str, status: str = "default") -> str:
     return (f'<span style="display:inline-block;padding:2px 10px;background:{bg};'
             f'color:{fg};border:2px solid #000;border-radius:999px;font-family:\'Space Mono\',monospace;'
             f'font-size:0.8rem;font-weight:700;box-shadow:1.5px 1.5px 0px #000;">{html.escape(text)}</span>')
+
+
+def money_columns(*names: str) -> dict:
+    """column_config entries that right-align amount columns and fix them to 2 decimals."""
+    return {n: st.column_config.NumberColumn(n, format="%.2f") for n in names}
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def pdf_page_png(data: bytes, page: int = 0, zoom: float = 1.6) -> tuple[bytes, int]:
+    """Render one PDF page to PNG. Returns (png_bytes, page_count)."""
+    import fitz  # PyMuPDF
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        pix = doc[min(page, doc.page_count - 1)].get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png"), doc.page_count
+
+
+def invoice_preview(invoices: list, pdf_data: dict, key: str = "preview"):
+    """Original PDF on the left, the fields extracted from it on the right, for quick eyeball checks.
+    `pdf_data` maps each invoice's extra["_file_hash"] to the uploaded PDF bytes."""
+    labels = [f"{inv.source_file} — {inv.vendor} #{inv.invoice_number or 'N/A'}" for inv in invoices]
+    if st.session_state.get(f"{key}_sel", 0) >= len(invoices):  # a smaller new batch invalidates the old pick
+        st.session_state[f"{key}_sel"] = 0
+    idx = st.selectbox("Invoice to verify", range(len(invoices)), format_func=labels.__getitem__, key=f"{key}_sel")
+    inv = invoices[idx]
+    data = pdf_data.get(inv.extra.get("_file_hash"))
+
+    doc_col, data_col = st.columns([1.3, 1], gap="large")
+    with doc_col:
+        if not data:
+            st.info("Original PDF is no longer available — re-run the extraction to preview it.", icon=":material/visibility_off:")
+        else:
+            try:
+                _, n_pages = pdf_page_png(data)
+                page = st.number_input("Page", 1, n_pages, 1, key=f"{key}_page_{idx}") if n_pages > 1 else 1
+                st.image(pdf_page_png(data, page - 1)[0], caption=f"{inv.source_file} · page {page} of {n_pages}")
+            except Exception as e:
+                st.warning(f"Could not render a preview of this PDF ({e}).", icon=":material/broken_image:")
+
+    with data_col:
+        ok = inv.validation_ok and not inv.rule_failures and not inv.duplicate_note
+        st.markdown(status_pill("PASS" if ok else "REVIEW", "success" if ok else "warning"), unsafe_allow_html=True)
+        fields = {"Vendor": inv.vendor, "Invoice #": inv.invoice_number, "Date": inv.invoice_date,
+                  "PO #": inv.po_number, "Subtotal": inv.subtotal, "Tax": inv.tax, "Total": inv.total}
+        fields.update({k.replace("_", " ").title(): v for k, v in inv.extra.items() if not k.startswith("_")})
+        st.dataframe([{"Field": k, "Value": "—" if v in (None, "") else (f"{v:,.2f}" if isinstance(v, float) else str(v))}
+                      for k, v in fields.items()], hide_index=True, use_container_width=True)
+        for note in [*inv.validation_notes, *inv.rule_failures, *([inv.duplicate_note] if inv.duplicate_note else [])]:
+            st.caption(f"• {note}")
+        if inv.line_items:
+            st.dataframe([li.cols for li in inv.line_items], hide_index=True, use_container_width=True)
