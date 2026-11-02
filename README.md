@@ -69,7 +69,7 @@ Template mode, OCR, and validation work without any API key. For AI extraction, 
 | :--- | :--- | :--- |
 | Anthropic (Claude) | `claude-sonnet-5` | `ANTHROPIC_API_KEY` |
 | OpenAI | `gpt-4o` | `OPENAI_API_KEY` |
-| Google Gemini | `gemini-2.5-flash` | `GEMINI_API_KEY` |
+| Google Gemini | `gemini-3.8-flash` | `GEMINI_API_KEY` |
 | Groq | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | Mistral | `mistral-large-latest` | `MISTRAL_API_KEY` |
 | OpenRouter | editable | `OPENROUTER_API_KEY` |

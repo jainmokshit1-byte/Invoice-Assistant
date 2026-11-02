@@ -592,7 +592,7 @@ LLM_PRESETS = {
     "Google Gemini": {
         "provider": "openai",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.5-flash", "key_env": "GEMINI_API_KEY"},
+        "model": "gemini-3.8-flash", "key_env": "GEMINI_API_KEY"},
     "Groq": {
         "provider": "openai", "base_url": "https://api.groq.com/openai/v1",
         "model": "llama-3.3-70b-versatile", "key_env": "GROQ_API_KEY"},
@@ -674,34 +674,51 @@ def _call_openai(prompt, api_key, model, base_url, max_tokens=4096, images=None)
     # Account/model/network problems won't be fixed by tweaking request parameters: stop at once.
     fatal = (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError,
              openai.RateLimitError, openai.APIConnectionError)
-    last_exc = None
-    _NATIVE_JSON_HOSTS = ("api.openai.com", "api.anthropic.com")
-    _is_native = any(h in (base_url or "") for h in _NATIVE_JSON_HOSTS)
-    _formats = [{"type": "json_object"}, None] if _is_native else [None]
-    _extra_bodies = [{"chat_template_kwargs": {"enable_thinking": False}}, None] if not _is_native else [None]
 
-    # Providers differ in which optional parameters they accept (response_format,
-    # max_tokens vs max_completion_tokens, vLLM's chat_template_kwargs): try variants.
+    url_str = (base_url or "").lower()
+    is_gemini = "generativelanguage.googleapis.com" in url_str
+    is_openai = "api.openai.com" in url_str
+    is_vllm = any(h in url_str for h in ("localhost", "127.0.0.1", "8000", "vllm"))
+
+    def get_candidate_params():
+        candidates = []
+        if is_gemini:
+            # 1. Fastest: reasoning_effort='none' + json_object (bypasses thinking tokens, instant response)
+            candidates.append({"max_tokens": max_tokens, "response_format": {"type": "json_object"}, "reasoning_effort": "none"})
+            # 2. Fast: reasoning_effort='low' + json_object (minimal thinking budget)
+            candidates.append({"max_tokens": max_tokens, "response_format": {"type": "json_object"}, "reasoning_effort": "low"})
+            # 3. Standard JSON object without reasoning constraint
+            candidates.append({"max_tokens": max_tokens, "response_format": {"type": "json_object"}})
+            # 4. Minimal fallback
+            candidates.append({"max_tokens": max_tokens})
+        elif is_openai:
+            candidates.append({"max_tokens": max_tokens, "response_format": {"type": "json_object"}})
+            candidates.append({"max_completion_tokens": max_tokens, "response_format": {"type": "json_object"}})
+            candidates.append({"max_tokens": max_tokens})
+        elif is_vllm:
+            candidates.append({"max_tokens": max_tokens, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}})
+            candidates.append({"max_tokens": max_tokens})
+        else:
+            candidates.append({"max_tokens": max_tokens, "response_format": {"type": "json_object"}})
+            candidates.append({"max_tokens": max_tokens})
+            candidates.append({})
+        return candidates
+
+    last_exc = None
     for with_images in ([True, False] if images else [False]):
-        for eb in _extra_bodies:
-            for fmt in _formats:
-                for token_kw in [{"max_tokens": max_tokens}, {"max_completion_tokens": max_tokens}, {}]:
-                    try:
-                        call_kwargs = dict(model=model, messages=[{"role": "user", "content": content(with_images)}],
-                                           **token_kw)
-                        if fmt:
-                            call_kwargs["response_format"] = fmt
-                        if eb:
-                            call_kwargs["extra_body"] = eb
-                        resp = client.chat.completions.create(**call_kwargs)
-                        text = resp.choices[0].message.content or ""
-                        if text.strip():
-                            return text
-                    except fatal as e:
-                        raise _api_error(openai, e, model) from e
-                    except Exception as e:
-                        last_exc = e
-                        continue
+        messages = [{"role": "user", "content": content(with_images)}]
+        for params in get_candidate_params():
+            try:
+                call_kwargs = dict(model=model, messages=messages, **params)
+                resp = client.chat.completions.create(**call_kwargs)
+                text = resp.choices[0].message.content or ""
+                if text.strip():
+                    return text
+            except fatal as e:
+                raise _api_error(openai, e, model) from e
+            except Exception as e:
+                last_exc = e
+                continue
     if last_exc is not None:
         raise RuntimeError(
             f"All API call attempts failed. Last error: {last_exc}"

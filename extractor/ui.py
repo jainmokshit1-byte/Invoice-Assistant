@@ -1868,7 +1868,7 @@ def ai_provider_form(key: str) -> dict:
 
     local = name.startswith("Local")
     model = c2.text_input("Model ID", key=f"{key}_model",
-                          help="E.g. claude-sonnet-5, gpt-4o, gemini-2.5-flash, llama-3.3-70b-versatile.")
+                          help="E.g. claude-sonnet-5, gpt-4o, gemini-3.8-flash, llama-3.3-70b-versatile.")
     api_key = c1.text_input("API key" + (" (optional for local models)" if local else ""),
                             type="password", key=f"{key}_key",
                             help="Used only for this session; never written to disk or logs.")

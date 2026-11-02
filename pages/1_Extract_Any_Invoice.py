@@ -94,13 +94,16 @@ if uploads and st.button("Run AI Extraction Pipeline", icon=":material/play_arro
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
                         f.write(data)
                         tmp = f.name
-                    status.update(label=f"{step} · reading text (OCR if scanned) and querying AI model")
+                    import time
+                    t0 = time.time()
+                    status.update(label=f"{step} · querying {cfg['model']}…")
                     inv = extract_generic(
                         tmp, api_key=cfg["api_key"], model=cfg["model"],
                         provider=cfg["provider"], base_url=cfg["base_url"])
                     inv.source_file = up.name
                     inv.extra["_file_hash"] = file_hash(tmp)
                     pdf_data[inv.extra["_file_hash"]] = data
+                    elapsed = time.time() - t0
                     status.update(label=f"{step} · reconciling against printed totals")
                     try:  # scans are checked against their OCR text
                         inv.reconciliation = reconcile(inv, tmp)
@@ -109,7 +112,8 @@ if uploads and st.button("Run AI Extraction Pipeline", icon=":material/play_arro
                     status.update(label=f"{step} · applying business rules")
                     apply_rules(inv, load_rules())
                     invoices.append(inv)
-                    st.write(f":material/check_circle: **{up.name}** — {inv.vendor} #{inv.invoice_number or 'N/A'}"
+                    st.write(f":material/check_circle: **{up.name}** — {inv.vendor} #{inv.invoice_number or 'N/A'} "
+                             f"({elapsed:.1f}s)"
                              + (" · OCR" if getattr(inv, "ocr_used", False) else "")
                              + ("" if inv.validation_ok else " · needs review"))
                 except Exception as e:

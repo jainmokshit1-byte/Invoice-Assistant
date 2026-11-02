@@ -592,10 +592,8 @@ def extract_generic(pdf_path: str, api_key: str, model: str,
         # Dynamic token budget: (rows × 200 tokens/row) + 1500 header overhead
         # + 20% safety buffer. Capped at provider maximums.
         _row_count = row_hint   # FIX 2: reuse result from outer scope — avoids double PDF parse
-        _needed = int((_row_count * 200 + 1500) * 1.2)
-        _is_gemini = "generativelanguage.googleapis.com" in (base_url or "")
-        _provider_cap = 65536 if _is_gemini else 16384
-        _tokens = max(4096, min(_needed, _provider_cap))
+        _needed = int((_row_count * 150 + 1000) * 1.3)
+        _tokens = max(2048, min(_needed, 16384))
 
         if provider == "anthropic":
             # 16k: newer Claude models think before answering, and thinking shares this budget
